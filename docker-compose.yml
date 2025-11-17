@@ -1,0 +1,69 @@
+services:
+  # Message Bus (NATS)
+  nats:
+    image: nats:latest
+    container_name: signalgrid-nats
+    ports:
+      - "4222:4222"   # client connections
+      - "8222:8222"   # monitoring UI
+    restart: unless-stopped
+
+  # Pulse: Event Producer
+  pulse:
+    build:
+      context: ./services/pulse
+      dockerfile: Dockerfile
+    container_name: signalgrid-pulse
+    environment:
+      NATS_URL: "nats://nats:4222"
+    depends_on:
+      - nats
+    ports:
+      - "8001:8001"   # HTTP API for frontend
+    restart: unless-stopped
+
+  # Forge: Event Processor
+  forge:
+    build:
+      context: ./services/forge
+      dockerfile: Dockerfile
+    container_name: signalgrid-forge
+    environment:
+      NATS_URL: "nats://nats:4222"
+    depends_on:
+      - nats
+    ports:
+      - "8002:8002"   # HTTP API for frontend
+    restart: unless-stopped
+
+  # Archive: Storage + REST API
+  archive:
+    build:
+      context: ./services/archive
+      dockerfile: Dockerfile
+    container_name: signalgrid-archive
+    environment:
+      NATS_URL: "nats://nats:4222"
+      DATABASE_URL: "postgres://signalgrid:signalgrid@postgres:5432/signalgrid"
+    depends_on:
+      - nats
+      - postgres
+    ports:
+      - "8003:8003"   # HTTP API for frontend
+    restart: unless-stopped
+
+  # PostgreSQL
+  postgres:
+    image: postgres:15
+    container_name: signalgrid-postgres
+    environment:
+      POSTGRES_USER: signalgrid
+      POSTGRES_PASSWORD: signalgrid
+      POSTGRES_DB: signalgrid
+    ports:
+      - "5432:5432"
+    volumes:
+      - type: bind
+        source: ./init.sql
+        target: /docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
