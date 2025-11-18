@@ -52,6 +52,19 @@ services:
       - "8003:8003"   # HTTP API for frontend
     restart: unless-stopped
 
+  forecast:
+    build:
+      context: ./services/forecast
+      dockerfile: Dockerfile
+    container_name: signalgrid-forecast
+    environment:
+      NATS_URL: "nats://nats:4222"
+    depends_on:
+      - nats
+    ports:
+      - "8004:8004"   # HTTP API for forecasts
+    restart: unless-stopped
+
   # PostgreSQL
   postgres:
     image: postgres:15

@@ -5,12 +5,62 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
+use sqlx::FromRow;
 use warp::Filter;
+use std::convert::Infallible;
+use std::collections::HashMap;
+use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Event {
-    id: String,
-    message: String,
+// Helper to pass DB pool into warp filters
+fn with_db(
+    pool: sqlx::PgPool,
+) -> impl Filter<Extract = (sqlx::PgPool,), Error = Infallible> + Clone {
+    warp::any().map(move || pool.clone())
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, FromRow)]
+struct Stats {
+    station: String,
+    sensor: String,
+    mean: f64,
+    min: f64,
+    max: f64,
+    count: i64,
+    timestamp: i64,
+}
+
+// Query historical events
+async fn query_events(
+    pool: &sqlx::PgPool,
+    sensor: Option<&str>,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
+) -> anyhow::Result<Vec<Stats>> {
+    let mut conditions = Vec::new();
+    if sensor.is_some() {
+        conditions.push(format!("sensor = '{}'", sensor.unwrap()));
+    }
+    if let Some(start) = start_ts {
+        conditions.push(format!("timestamp >= {}", start));
+    }
+    if let Some(end) = end_ts {
+        conditions.push(format!("timestamp <= {}", end));
+    }
+
+    let where_clause = if conditions.is_empty() {
+        "".to_string()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    let query_str = format!("SELECT station, sensor, timestamp, mean, min, max, count FROM stats {}", where_clause);
+
+    let events = sqlx::query_as::<_, Stats>(&query_str)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(events)
 }
 
 #[tokio::main]
@@ -18,100 +68,111 @@ async fn main() -> anyhow::Result<()> {
     println!("Archive: Starting up");
 
     // -------------------------
-    // 1. Connect to NATS
+    // Connect to NATS
     // -------------------------
-    let nats_url = "nats://nats:4222".to_string();
-    let client = match ConnectOptions::new().connect(&nats_url).await {
-        Ok(c) => {
-            println!("Archive connected to NATS at {}", nats_url);
-            c
-        }
-        Err(e) => {
-            eprintln!("Archive: Failed to connect to NATS at {}: {:?}", nats_url, e);
-            return Err(e.into());
-        }
-    };
+    let nats_url = "nats://nats:4222";
+    let client = ConnectOptions::new().connect(&nats_url).await?;
+    println!("Archive connected to NATS at {}", nats_url);
 
     // -------------------------
-    // 2. Connect to Database
+    // Connect to DB
     // -------------------------
-    println!("Archive: Connecting to database");
-    let db_url = "postgres://signalgrid:signalgrid@postgres:5432/signalgrid".to_string();
+    let db_url = "postgres://signalgrid:signalgrid@postgres:5432/signalgrid";
     let pool = PgPoolOptions::new().max_connections(5).connect(&db_url).await?;
+    println!("Archive: Connected to database");
 
     // -------------------------
-    // 3. Shared last archived event
+    // Shared event buffer
     // -------------------------
-    let last_event: Arc<tokio::sync::Mutex<Option<Event>>> = Arc::new(tokio::sync::Mutex::new(None));
+    let event_buffer: Arc<tokio::sync::Mutex<Vec<Stats>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     // -------------------------
-    // 4. HTTP server
+    // NATS subscription
     // -------------------------
-    let last_event_filter = warp::any().map({
-        let last_event = last_event.clone();
-        move || last_event.clone()
-    });
-
-    let fetch_route = warp::path("archive")
-        .and(last_event_filter)
-        .and_then(|last_event: Arc<tokio::sync::Mutex<Option<Event>>>| async move {
-            let event = last_event.lock().await;
-            Ok::<_, warp::Rejection>(warp::reply::json(&*event))
-        })
-        .with(warp::cors().allow_any_origin());
-
-    
-
-    // -------------------------
-    // 5. NATS listener
-    // -------------------------
-    let sub = client.subscribe("enriched_events").await?;
+    let sub = client.subscribe("stats").await?;
     let mut messages = sub;
+    let buffer_clone = event_buffer.clone();
 
-    let last_event_clone = last_event.clone();
-    let pool_clone = pool.clone();
-    let nats_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         while let Some(msg) = messages.next().await {
             let payload: Bytes = msg.payload;
-
-            match serde_json::from_slice::<Event>(&payload) {
-                Ok(event) => {
-                    println!("Archive processed event: {:?}", event);
-
-                    // Insert into database
-                    if let Err(e) = sqlx::query(
-                        "INSERT INTO events (id, message) VALUES ($1, $2)"
-                    )
-                    .bind(&event.id)
-                    .bind(&event.message)
-                    .execute(&pool_clone)
-                    .await
-                    {
-                        eprintln!("Archive: Failed to insert event into DB: {:?}", e);
-                    }
-
-
-                    // Update last archived event
-                    let mut guard = last_event_clone.lock().await;
-                    *guard = Some(event);
-                }
-                Err(e) => eprintln!("Archive: Failed to parse event: {:?}", e),
+            if let Ok(event) = serde_json::from_slice::<Stats>(&payload) {
+                // Add to buffer
+                let mut buf = buffer_clone.lock().await;
+                buf.push(event);
+            } else {
+                eprintln!("Archive: Failed to parse event");
             }
         }
 
-        // Keep listener alive if subscription ends
+        // Keep listener alive
         loop {
             eprintln!("Archive: NATS subscription ended, retrying in 5s...");
             time::sleep(Duration::from_secs(5)).await;
         }
     });
 
+    // -------------------------
+    // Flush buffer every 12 minutes
+    // -------------------------
+    let buffer_clone = event_buffer.clone();
+    let pool_clone = pool.clone();
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+
+            let mut buf = buffer_clone.lock().await;
+            if buf.is_empty() {
+                continue;
+            }
+
+            println!("Flushing {} events to database", buf.len());
+
+            for event in buf.drain(..) {
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO stats ( id, station, sensor, timestamp, mean, min, max, count) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(&event.station)
+                .bind(&event.sensor)
+                .bind(event.timestamp)
+                .bind(event.mean)
+                .bind(event.min)
+                .bind(event.max)
+                .bind(event.count)
+                .execute(&pool_clone)
+                .await
+                {
+                    eprintln!("Archive: Failed to insert event: {:?}", e);
+                }
+            }
+        }
+    });
+
+    // -------------------------
+    // HTTP endpoint for historical stats
+    // ---
+    let stats_route = warp::path("stats")
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(with_db(pool.clone())) // this is fine now
+        .and_then(|params: HashMap<String, String>, pool: sqlx::PgPool| async move {
+            let sensor = params.get("sensor").map(|s| s.as_str());
+            let start_ts = params.get("start_ts").and_then(|s| s.parse::<i64>().ok());
+            let end_ts = params.get("end_ts").and_then(|s| s.parse::<i64>().ok());
+
+            match query_events(&pool, sensor, start_ts, end_ts).await {
+                Ok(stats) => Ok::<_, Infallible>(warp::reply::json(&stats)),
+                Err(e) => Ok::<_, Infallible>(warp::reply::json(&serde_json::json!({
+                    "error": format!("Internal server error: {:?}", e)
+                }))),
+            }
+        });
+
+
     println!("HTTP server running at http://0.0.0.0:8003");
-    warp::serve(fetch_route).run(([0, 0, 0, 0], 8003)).await;
-
-
-    // Keep main alive by awaiting both tasks
-    nats_handle.await?;
+    warp::serve(stats_route).run(([0, 0, 0, 0], 8003)).await;
 
     Ok(())
 }
