@@ -17,5 +17,4 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /usr/local/bin
 COPY --from=builder /usr/src/forge/target/release/forge .
-EXPOSE 8002
 CMD ["./forge"]

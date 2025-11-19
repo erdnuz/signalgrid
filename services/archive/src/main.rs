@@ -22,7 +22,7 @@ fn with_db(
 #[derive(Debug, Serialize, Deserialize, Clone, FromRow)]
 struct Stats {
     station: String,
-    sensor: String,
+    sensor: i32,
     mean: f64,
     min: f64,
     max: f64,

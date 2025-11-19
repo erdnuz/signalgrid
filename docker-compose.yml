@@ -18,8 +18,6 @@ services:
       NATS_URL: "nats://nats:4222"
     depends_on:
       - nats
-    ports:
-      - "8001:8001"   # HTTP API for frontend
     restart: unless-stopped
 
   # Forge: Event Processor
@@ -32,8 +30,6 @@ services:
       NATS_URL: "nats://nats:4222"
     depends_on:
       - nats
-    ports:
-      - "8002:8002"   # HTTP API for frontend
     restart: unless-stopped
 
   # Archive: Storage + REST API
@@ -48,8 +44,6 @@ services:
     depends_on:
       - nats
       - postgres
-    ports:
-      - "8003:8003"   # HTTP API for frontend
     restart: unless-stopped
 
   forecast:
