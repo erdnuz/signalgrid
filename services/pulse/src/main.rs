@@ -4,8 +4,7 @@ use crate::simulator::IoTSensorSimulator;
 use async_nats::ConnectOptions;
 use bytes::Bytes;
 use tokio::time::{Duration};
-
-
+use chrono::Utc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,20 +13,22 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Pulse connected to NATS at {}", nats_url);
 
-    // Initialize environment state
-    let mut simulator = IoTSensorSimulator::new(4);
+    // Initialize simulator with 4 channels and 3 regimes
+    let mut simulator = IoTSensorSimulator::new();
     let nc_pub = nc.clone();
+
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(5));
+        let mut interval = tokio::time::interval(Duration::from_millis(100)); // realistic interval
         loop {
             interval.tick().await;
 
             let sample = simulator.step();
 
-            // Convert sample to event structure
+            // Convert sample to event structure, include current regime
             let event = serde_json::json!({
-               "timestamp": chrono::Utc::now().timestamp_millis() as u64,
+                "timestamp": Utc::now().timestamp_millis() as u64,
                 "values": sample,
+                "regime": simulator.regime_idx,
                 "station":"StationA"
             });
 
@@ -40,7 +41,6 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::signal::ctrl_c().await?;
     println!("Shutting down...");
-
 
     Ok(())
 }

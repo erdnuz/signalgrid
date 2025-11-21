@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
                 _ = &mut sleep => {
                     if !buffer.is_empty() {
                         let now_ms = Utc::now().timestamp_millis() as u64;
-                        let cutoff_ms = now_ms.saturating_sub(2_000); // 30 seconds in ms
+                        let cutoff_ms = now_ms.saturating_sub(600); // 30 seconds in ms
                         buffer.retain(|e| e.timestamp > cutoff_ms);
 
                         println!("Forge processing {} events", buffer.len());
@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     // Reset sleep
-                    sleep = Box::pin(time::sleep(Duration::from_secs(1)));
+                    sleep = Box::pin(time::sleep(Duration::from_millis(400)));
                 }
             }
         }

@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 # Configuration
 # -------------------------
 NATS_URL = os.getenv("NATS_URL", "nats://nats:4222")
-MAX_POINTS = 100  # points to store per line
+MAX_POINTS = 500  # points to store per line
 
 
 # -------------------------
