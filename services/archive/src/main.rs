@@ -33,11 +33,15 @@ struct Stats {
 // Query historical events
 async fn query_events(
     pool: &sqlx::PgPool,
+    station: Option<&str>,
     sensor: Option<&str>,
     start_ts: Option<i64>,
     end_ts: Option<i64>,
 ) -> anyhow::Result<Vec<Stats>> {
     let mut conditions = Vec::new();
+    if station.is_some() {
+        conditions.push(format!("station = '{}'", sensor.unwrap()));
+    }
     if sensor.is_some() {
         conditions.push(format!("sensor = '{}'", sensor.unwrap()));
     }
@@ -112,9 +116,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // -------------------------
-    // Flush buffer every 12 minutes
-    // -------------------------
     let buffer_clone = event_buffer.clone();
     let pool_clone = pool.clone();
     tokio::spawn(async move {
@@ -158,11 +159,12 @@ async fn main() -> anyhow::Result<()> {
         .and(warp::query::<HashMap<String, String>>())
         .and(with_db(pool.clone())) // this is fine now
         .and_then(|params: HashMap<String, String>, pool: sqlx::PgPool| async move {
+            let station = params.get("station").map(|s| s.as_str());
             let sensor = params.get("sensor").map(|s| s.as_str());
             let start_ts = params.get("start_ts").and_then(|s| s.parse::<i64>().ok());
             let end_ts = params.get("end_ts").and_then(|s| s.parse::<i64>().ok());
 
-            match query_events(&pool, sensor, start_ts, end_ts).await {
+            match query_events(&pool, station, sensor, start_ts, end_ts).await {
                 Ok(stats) => Ok::<_, Infallible>(warp::reply::json(&stats)),
                 Err(e) => Ok::<_, Infallible>(warp::reply::json(&serde_json::json!({
                     "error": format!("Internal server error: {:?}", e)

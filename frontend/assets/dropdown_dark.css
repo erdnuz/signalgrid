@@ -1,0 +1,52 @@
+/* Dropdown control (selected text) */
+/* Remove default page margins and enforce dark page background */
+body, html {
+    margin: 0 !important;
+    padding: 0 !important;
+    background-color: #0f1116 !important;
+}
+
+
+.Select-control {
+    background-color: #1a1d24 !important;
+    color: #e0e6ed !important;
+    border: 1px solid #2a2f3b !important;
+}
+
+/* Placeholder text */
+.Select-placeholder {
+    color: #e0e6ed !important;
+}
+
+/* Value text */
+.Select-value-label {
+    color: #e0e6ed !important;
+}
+
+/* Dropdown menu background */
+.Select-menu-outer {
+    background-color: #1a1d24 !important;
+    border: 1px solid #2a2f3b !important;
+}
+
+/* Option text */
+.Select-option {
+    background-color: #1a1d24 !important;
+    color: #e0e6ed !important;
+}
+
+/* Highlighted option */
+.Select-option.is-focused {
+    background-color: #2a2f3b !important;
+    color: #e0e6ed !important;
+}
+
+/* Selected option in menu */
+.Select-option.is-selected {
+    background-color: #25303e !important;
+    color: #e0e6ed !important;
+}
+
+.Select-input input {
+    color: #e0e6ed !important;
+}

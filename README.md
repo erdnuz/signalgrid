@@ -1,89 +1,67 @@
 # Signal Grid
 
-## Simulation time
+**Signal Grid** is a microservice-based data pipeline for simulating, processing, forecasting, and visualizing sensor data. It provides real-time statistics, forecasts with confidence intervals, and a web dashboard for monitoring.
 
-30s to 1hour
+---
 
-12 minutes = 1 day
+## Architecture Overview
 
-## Weather Simulation
+The application consists of several services communicating via **NATS**:
 
-### Base System
+- **Pulse (Rust)**: Simulates OU (Ornstein-Uhlenbeck) sensor data with regime changes and publishes to NATS.  
+- **Forge (Rust)**: Subscribes to the data, computes statistics (mean, min, max), and republishes results to NATS.  
+- **Archive (Rust)**: Subscribes to stats and archives them in a PostgreSQL database. Provides an API to query historical data by station, sensor, and time range.  
+- **Forecast (Python)**: Subscribes to data and stats, produces forecasts with confidence intervals, and publishes forecast results.  
+- **Frontend (Python / Dash)**: Dash-based web dashboard to visualize live and forecasted sensor data. Users can select stations and--
 
-Temperature:
-Diurnal cycle, annual cycle, random fluctuations (noise/random walk)
+---
 
-Wind:
-Base speed (diurnal), random fluctuations (AR1)
+## Directory Structure
 
-Pressure:
-Seasonal cycle, short-term noise
+```text
+signal-grid/
+├── docker-compose.yml
+├── frontend/ # Python
+├── init.sql
+├── README.md
+└── services/
+    ├── archive/ # Rust
+    ├── forecast/ # Python
+    ├── forge/ # Rust
+    └── pulse/ # Rust
+```
 
-Humidity: Diurnal cycle, temperature dependence, precipitation dependance
+---
 
-Precipitation: Probability of rain (seasonal/diurnal), random amount
+## Installation
 
-### Warm Rain Storm
+### Prerequisites
 
-Pre: Falling pressure, increasing humidity, darkening clouds, wind shift
+- Docker & Docker Compose installed  
+- Git
 
-Duration: 3–6 hours
-During: Slight temperature increase, increased gusts, heavy rain bursts, near-saturated humidity
+### Clone the repository
 
-Duration: 6–24 hours
-Post: Clearing skies, rising pressure, winds calming, residual moisture
+```bash
+git clone https://github.com/erdnuz/signalgrid
+cd signalgrid
+```
 
-Duration: 3–6 hours
-Occurrences/year: 50–120 (depends on region, more frequent in spring/summer)
+### Start the services
 
-### Cold Rain Storm
+```bash
+docker-compose up --build
+```
 
-Pre: Sharp temperature drop, wind shift, approaching cold front on radar
+This will:
 
-Duration: 1–3 hours
-During: Strong gusty winds, falling temperature, moderate to heavy rain (possibly mixed with snow near freezing)
+1. Launch **NATS** server for inter-service messaging.
+2. Start **PostgreSQL** for archival storage.
+3. Run all services: `pulse`, `forge`, `forecast`, `archive`, and `frontend`.
 
-Duration: 6–18 hours
-Post: Rising pressure, winds calming, clearing skies, residual dampness
+### Access the frontend
 
-Duration: 3–6 hours
-Occurrences/year: 40–100 (more frequent in late fall and early spring)
+Open your browser at: [http://localhost:8004](http://localhost:8004)
 
-### Cold Snap
-
-Pre: Rapid temperature drop, clear frontal passage, falling dew point
-
-Duration: 3–12 hours
-During: Sudden cold below seasonal norms, gusty winds if frontal, possible snow/frost
-
-Duration: 1–7 days
-Post: Gradual warming, stabilization of pressure, residual frost/ice melt
-
-Duration: 1–2 days
-Occurrences/year: 10–30 (more frequent in winter)
-
-### Fog
-
-Pre: Clear nights, calm winds, high humidity, radiation cooling
-
-Duration: 1–3 hours
-During: Near-surface cooling/inversion, low wind, high humidity, minimal drizzle
-
-Duration: 3–12 hours (longer in valleys or persistent conditions)
-Post: Sun rises or winds pick up, fog disperses, visibility improves
-
-Duration: 1–2 hours
-Occurrences/year: 30–100 (higher in fall/winter, coastal/mountain regions)
-
-### Heatwave
-
-Pre: Prolonged high-pressure system, stable clear skies, slow-moving warm air mass
-
-Duration: 1–2 days
-During: Prolonged high temperatures, light wind, low precipitation
-
-Duration: 3–14 days
-Post: Gradual cooling as high pressure shifts or storms approach
-
-Duration: 1–3 days
-Occurrences/year: 1–5 (depends on region; more in southern and central NA)
+- Use the dropdowns to select a station and sensor.
+- View live measurements, forecasts, and confidence intervals.

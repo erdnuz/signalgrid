@@ -55,8 +55,19 @@ services:
       NATS_URL: "nats://nats:4222"
     depends_on:
       - nats
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: signalgrid-frontend
+    environment:
+      NATS_URL: "nats://nats:4222"
+    depends_on:
+      - nats
     ports:
-      - "8004:8004"   # HTTP API for forecasts
+      - "8004:8004"
     restart: unless-stopped
 
   # PostgreSQL

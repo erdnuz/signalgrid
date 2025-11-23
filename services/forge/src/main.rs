@@ -56,8 +56,6 @@ async fn main() -> anyhow::Result<()> {
                         let cutoff_ms = now_ms.saturating_sub(600); // 30 seconds in ms
                         buffer.retain(|e| e.timestamp > cutoff_ms);
 
-                        println!("Forge processing {} events", buffer.len());
-
                         // Aggregate stats per sensor index
                         let mut map: HashMap<(String, usize), Vec<f64>> = HashMap::new();
                         for e in &buffer {

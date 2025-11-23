@@ -2,179 +2,112 @@ import asyncio
 import json
 import os
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
-from dash import Dash, dcc, html
-from dash.dependencies import Input, Output
+from scipy.stats import t
 from nats.aio.client import Client as NATS
-import plotly.graph_objects as go
+import numpy as np
 
-# -------------------------
-# Configuration
-# -------------------------
 NATS_URL = os.getenv("NATS_URL", "nats://nats:4222")
-MAX_POINTS = 500  # points to store per line
+FORECAST_HORIZON = 3
+TIME_DELTA_SEC = 0.4
+MAX_POINTS = 50
+MIN_POINTS = 20
+
+recent_data = defaultdict(list)
+forecast_tasks = {}  # key -> asyncio.Task
+
+def forecast_ou(values, n_steps=3, alpha=0.02):
+    if len(values) < MIN_POINTS:
+        return None, None
+
+    x = np.array(values)
+    x_t = x[:-1]
+    x_tp1 = x[1:]
+
+    # Fit discrete OU (AR1)
+    phi = np.corrcoef(x_t, x_tp1)[0,1] * np.std(x_tp1)/np.std(x_t)
+    mu = np.mean(x_tp1 - phi * x_t) / (1 - phi)
+    sigma_eps = np.sqrt(np.mean((x_tp1 - (phi*x_t + (1-phi)*mu))**2))
+
+    last_val = x[-1]
+    forecasts = []
+    ci_list = []
+
+    n = len(values)
+    t_val = t.ppf(1 - alpha/2, df=n-2)  # df = n-2 for slope/intercept
+
+    for h in range(1, n_steps+1):
+        next_val = mu + phi**h * (last_val - mu)
+        forecasts.append(next_val)
+        se_phi = sigma_eps / np.sqrt(np.sum((x_t - np.mean(x_t))**2))
+        se_mu = sigma_eps * np.sqrt(1/len(x_t) + np.mean(x_t)**2 / np.sum((x_t - np.mean(x_t))**2))
+
+        var_h = sigma_eps**2 * (1 - phi**(2*h)) / (1 - phi**2)
+        var_h += (h * se_phi)**2 + se_mu**2  # approximate accumulation of parameter uncertainty
+
+        lower = next_val - t_val * np.sqrt(var_h)
+        upper = next_val + t_val * np.sqrt(var_h)
+        ci_list.append((lower, upper))
+
+    return forecasts, ci_list
 
 
-# -------------------------
-# Dash app setup
-# -------------------------
-app = Dash(__name__)
-app.layout = html.Div([
-    html.H1("Live Sensor Forecast Data"),
-    
-    html.Div([
-        html.Label("Select Station:"),
-        dcc.Dropdown(
-            id="station-dropdown",
-            options=[{"label": "Any", "value": "Any"}],
-            value="Any",
-            clearable=False
-        ),
-        html.Label("Select Sensor:"),
-        dcc.Dropdown(
-            id="sensor-dropdown",
-            options=[],
-            value=None,
-            clearable=False
-        ),
-    ], style={"width": "30%", "display": "inline-block", "verticalAlign": "top"}),
+async def forecast_loop(nc: NATS, key):
+    """Run continuous forecasting for a single channel."""
+    while True:
+        if key not in recent_data or not recent_data[key]:
+            await asyncio.sleep(TIME_DELTA_SEC)
+            continue
 
-    dcc.Interval(id="interval", interval=2000),  # update every 2s
-    dcc.Graph(id="live-graph")
-])
+        ts, val = recent_data[key][-1]
+        values = [v for _, v in recent_data[key]]
 
-# -------------------------
-# Update station dropdown dynamically
-# -------------------------
-@app.callback(
-    Output("station-dropdown", "options"),
-    Input("interval", "n_intervals")
-)
-def update_station_options(_):
-    stations = sorted({station for station, _ in data_store.keys()})
-    options = [{"label": "Any", "value": "Any"}] + [{"label": s, "value": s} for s in stations]
-    return options
+        forecast_ts_list = [ts + timedelta(seconds=TIME_DELTA_SEC * i) for i in range(1, FORECAST_HORIZON + 1)]
+        forecast_vals_list, ci_list = forecast_ou(values, n_steps=FORECAST_HORIZON)
 
-# -------------------------
-# Update sensor dropdown based on station selection
-# -------------------------
-@app.callback(
-    Output("sensor-dropdown", "options"),
-    Input("station-dropdown", "value")
-)
-def update_sensor_options(selected_station):
-    if selected_station == "Any":
-        sensors = sorted({sensor for _, sensor in data_store.keys()})
-    else:
-        sensors = sorted({sensor for station, sensor in data_store.keys() if station == selected_station})
-    return [{"label": s, "value": s} for s in sensors]
+        if forecast_vals_list:
+            station, sensor = key
+            forecast_msg = {
+                "station": station,
+                "sensor": sensor,
+                "timestamps": [t.isoformat() for t in forecast_ts_list],
+                "forecasts": forecast_vals_list,
+                "upper_ci": [c[1] for c in ci_list],
+                "lower_ci": [c[0] for c in ci_list]
+            }
+            await nc.publish("forecasts", json.dumps(forecast_msg).encode())
+        await asyncio.sleep(TIME_DELTA_SEC)  # wait until next forecast step
 
-# -------------------------
-# Storage for live plotting
-# key: (station, sensor) -> dict of lists
-data_store = defaultdict(lambda: {
-    "timestamps": [], 
-    "means": [], 
-    "maxs": [], 
-    "mins": []
-})
-
-# -------------------------
-# Dash graph callback
-# -------------------------
-@app.callback(
-    Output("live-graph", "figure"),
-    [Input("interval", "n_intervals"),
-     Input("station-dropdown", "value"),
-     Input("sensor-dropdown", "value")]
-)
-def update_graph(_, selected_station, selected_sensor):
-    fig = go.Figure()
-    for (station, sensor), data in data_store.items():
-        if data["timestamps"]:
-            if selected_station == "Any" or station == selected_station:
-                if selected_sensor is None or sensor == selected_sensor:
-                    # Plot mean
-                    fig.add_trace(go.Scatter(
-                        x=data["timestamps"],
-                        y=data["means"],
-                        mode="lines+markers",
-                        name=f"{station}:{sensor} (mean)"
-                    ))
-                    # Plot max
-                    fig.add_trace(go.Scatter(
-                        x=data["timestamps"],
-                        y=data["maxs"],
-                        mode="lines",
-                        line=dict(dash="dash"),
-                        name=f"{station}:{sensor} (max)"
-                    ))
-                    # Plot min
-                    fig.add_trace(go.Scatter(
-                        x=data["timestamps"],
-                        y=data["mins"],
-                        mode="lines",
-                        line=dict(dash="dot"),
-                        name=f"{station}:{sensor} (min)"
-                    ))
-    fig.update_layout(
-        xaxis_title="Timestamp",
-        yaxis_title="Value",
-        template="plotly_dark"
-    )
-    return fig
-
-# -------------------------
-# NATS consumer
-# -------------------------
-async def consume_stats():
+async def process_stats_and_forecast():
     nc = NATS()
     await nc.connect(servers=[NATS_URL])
 
-    async def handler(msg):
-        try:
-            stat = json.loads(msg.data.decode())
-            station = stat["station"]
-            sensor = stat["sensor"]
-            ts = stat["timestamp"]
-            mean_val = stat["mean"]
-            max_val = stat["max"]
-            min_val = stat["min"]
+    async def handle_stats(msg):
+        stat = json.loads(msg.data.decode())
+        station = stat["station"]
+        sensor = stat["sensor"]
+        ts_millis = stat["timestamp"]
+        ts = datetime.fromtimestamp(ts_millis / 1000, tz=timezone.utc)
+        mean_val = stat["mean"]
 
-            key = (station, sensor)
-            entry = data_store[key]
+        key = (station, sensor)
+        recent_data[key].append((ts, mean_val))
+        if len(recent_data[key]) > MAX_POINTS:
+            recent_data[key] = recent_data[key][-MAX_POINTS:]
 
-            entry["timestamps"].append(ts)
-            entry["means"].append(mean_val)
-            entry["maxs"].append(max_val)
-            entry["mins"].append(min_val)
+        # Launch forecast task if not already running
+        if key not in forecast_tasks:
+            forecast_tasks[key] = asyncio.create_task(forecast_loop(nc, key))
 
-            if len(entry["timestamps"]) > MAX_POINTS:
-                entry["timestamps"].pop(0)
-                entry["means"].pop(0)
-                entry["maxs"].pop(0)
-                entry["mins"].pop(0)
-        except Exception as e:
-            print("Failed to process message:", e)
+    await nc.subscribe("stats", cb=handle_stats)
+    print("Subscribed to stats and launching per-channel forecasts...")
 
-    await nc.subscribe("stats", cb=handler)
+    stop_event = asyncio.Event()
+    await stop_event.wait()
 
-
-# -------------------------
-# Run both Dash and NATS consumer
-# -------------------------
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(consume_stats())
-
-    # Run Dash in a separate thread
-    from threading import Thread
-    def run_dash():
-        app.run(host="0.0.0.0", port=8004, debug=False)
-    Thread(target=run_dash, daemon=True).start()
-
-    print("Forecast live plot running at http://localhost:8004")
     try:
-        loop.run_forever()
+        asyncio.run(process_stats_and_forecast())
     except KeyboardInterrupt:
         print("Exiting...")
