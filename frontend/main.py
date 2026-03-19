@@ -43,34 +43,38 @@ def health():
 
 
 app.layout = html.Div([
-    html.H1("Live Sensor Forecast vs Actual", className="title"),
+    html.H1("Live Sensor Forecast", className="title"),
     html.Div([
         html.Div([
-            html.Label("Select Station:", className="label"),
+            html.Label("Select Station", className="label"),
             dcc.Dropdown(
                 id="station-dropdown",
                 options=[{"label": "Any", "value": "Any"}],
                 value="Any",
                 clearable=False,
-                className="dropdown"
+                className="dropdown",
+                searchable=False
             )
-        ]),
+        ], className="card"),
         html.Div([
-            html.Label("Select Sensor:", className="label"),
+            html.Label("Select Sensor", className="label"),
             dcc.Dropdown(
                 id="sensor-dropdown",
                 options=[],
                 value=None,
                 clearable=False,
-                className="dropdown"
+                className="dropdown",
+                searchable=False
             )
-        ]),
-    ], className="container", style={"display": "flex", "flexDirection": "row", "gap": "10px"}),
+        ], className="card"),
+    ], className="flex-row"),
     html.Div([
-        dcc.Graph(id="live-graph", className="chart-container", style={"height": "700px", "width": "95%"}, config={
-            "displayModeBar": False,
-            "scrollZoom": False
-        })
+        dcc.Graph(
+            id="live-graph",
+            className="chart-container",
+            style={"height": "700px", "width": "100%"},
+            config={"displayModeBar": False, "scrollZoom": False}
+        )
     ]),
     dcc.Interval(id="interval", interval=INTERVAL_MS),
 ], className="container")
@@ -119,7 +123,7 @@ def apply_stats_event(evt):
         entry = data_store[key]
         entry["timestamps"].append(datetime.fromtimestamp(evt["timestamp"] / 1000))
         entry["actuals"].append(mean)
-        if len(entry["timestamps"]) > MAX_POINTS:
+        if len(entry["timestamps"]) > MAX_POINTS -3:
             entry["timestamps"].pop(0)
             entry["actuals"].pop(0)
 
@@ -213,84 +217,92 @@ def update_graph(_, selected_station, selected_sensor):
         if selected_sensor is not None and sensor != selected_sensor:
             continue
 
-        # Actuals
-        if data["timestamps"]:
-            fig.add_trace(go.Scatter(
-                x=data["timestamps"],
-                y=data["actuals"],
-                mode="lines+markers",
-                name=f"{station}:{sensor} Actual",
-                line=dict(color="#00BCD4", width=2),
-                marker=dict(size=6, symbol="circle", opacity=0.8)
-            ))
+        
 
-        # Forecast with confidence interval
-        if data.get("forecast_ts") and data.get("forecasts") and data.get("lower_ci") and data.get("upper_ci"):
-            # Confidence interval shading
-            fig.add_trace(go.Scatter(
-                x=data["forecast_ts"],
-                y=data["upper_ci"],
-                mode="lines",
-                line=dict(width=0),
-                fill=None,
-                showlegend=False
-            ))
-            fig.add_trace(go.Scatter(
-                x=data["forecast_ts"],
-                y=data["lower_ci"],
-                mode="lines",
-                line=dict(width=0),
-                fill='tonexty',
-                fillcolor='rgba(255,165,0,0.2)',
-                showlegend=True,
-                name=f"{station}:{sensor} CI"
-            ))
-            # Forecast line
-            fig.add_trace(go.Scatter(
-                x=data["forecast_ts"],
-                y=data["forecasts"],
-                mode="lines",
-                line=dict(color="#FFA500", width=3, dash="dash"),
-                name=f"{station}:{sensor} Forecast"
-            ))
+        for (station, sensor), data in snapshot:
+            if selected_station != "Any" and station != selected_station:
+                continue
+            if selected_sensor is not None and sensor != selected_sensor:
+                continue
 
-    fig.update_layout(
-        xaxis=dict(
-            title="Time",
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.05)",
-            zeroline=False,
-            showline=True,
-            linecolor="#333",
-            tickfont=dict(size=12)
-        ),
-        yaxis=dict(
-            title="Value",
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.05)",
-            zeroline=False,
-            showline=True,
-            linecolor="#333",
-            tickfont=dict(size=12)
-        ),
-        template="plotly_dark",
-        plot_bgcolor="#1E1E1E",
-        paper_bgcolor="#121212",
-        font=dict(color="#FFF", family="Arial"),
-        legend=dict(
-            bgcolor="#222",
-            bordercolor="#444",
-            borderwidth=1,
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="center",
-            x=0.5,
-            font=dict(size=12)
-        ),
-        hovermode="x unified",
-        margin=dict(l=40, r=40, t=60, b=40)
-    )
+            # Actuals: blue
+            if data["timestamps"]:
+                fig.add_trace(go.Scatter(
+                    x=data["timestamps"],
+                    y=data["actuals"],
+                    mode="lines+markers",
+                    name=f"{station} Actual",
+                    line=dict(color="#2196f3", width=2),
+                    marker=dict(size=6, symbol="circle", opacity=0.8, color="#2196f3")
+                ))
+
+            # Forecast with confidence interval: yellow
+            if data.get("forecast_ts") and data.get("forecasts") and data.get("lower_ci") and data.get("upper_ci"):
+                # Confidence interval shading
+                fig.add_trace(go.Scatter(
+                    x=data["forecast_ts"],
+                    y=data["upper_ci"],
+                    mode="lines",
+                    line=dict(width=0),
+                    fill=None,
+                    showlegend=False
+                ))
+                fig.add_trace(go.Scatter(
+                    x=data["forecast_ts"],
+                    y=data["lower_ci"],
+                    mode="lines",
+                    line=dict(width=0),
+                    fill='tonexty',
+                    fillcolor='rgba(255,255,0,0.10)',
+                    showlegend=False
+                ))
+                # Forecast line
+                fig.add_trace(go.Scatter(
+                    x=data["forecast_ts"],
+                    y=data["forecasts"],
+                    mode="lines",
+                    line=dict(color="#FFD600", width=3, dash="dash"),
+                    name=f"{station} Forecast"
+                ))
+
+                fig.update_layout(
+                    autosize=True,
+                    xaxis=dict(
+                        title="Time",
+                        showgrid=True,
+                        gridcolor="rgba(255,255,255,0.05)",
+                        zeroline=False,
+                        showline=True,
+                        linecolor="#333",
+                        tickfont=dict(size=12)
+                    ),
+                    yaxis=dict(
+                        title="Value",
+                        showgrid=True,
+                        gridcolor="rgba(255,255,255,0.05)",
+                        zeroline=False,
+                        showline=True,
+                        linecolor="#333",
+                        tickfont=dict(size=12)
+                    ),
+                    template="plotly_dark",
+                    plot_bgcolor="#23272b",
+                    paper_bgcolor="#181c20",
+                    font=dict(color="#FFF", family="Arial"),
+                    legend=dict(
+                        bgcolor="#222",
+                        bordercolor="#444",
+                        borderwidth=1,
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="center",
+                        x=0.5,
+                        font=dict(size=12)
+                    ),
+                    hovermode="x unified",
+                    margin=dict(l=40, r=40, t=60, b=40)
+                )
     return fig
 
 

@@ -6,6 +6,8 @@
 
 ## Architecture Overview
 
+For a detailed description of the system and each service's responsibilities, see [Architecture.md](./Architecture.md).
+
 The application consists of several services communicating via **NATS**:
 
 - **Pulse (Rust)**: Simulates OU (Ornstein-Uhlenbeck) sensor data with regime changes and publishes to NATS.  
