@@ -1,3 +1,5 @@
 nats-py
 numpy
 scipy
+pytest
+pytest-asyncio

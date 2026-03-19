@@ -15,7 +15,7 @@ services:
       dockerfile: Dockerfile
     container_name: signalgrid-pulse
     environment:
-      NATS_URL: "nats://nats:4222"
+      NATS_URL: ${NATS_URL}
     depends_on:
       - nats
     restart: unless-stopped
@@ -27,7 +27,7 @@ services:
       dockerfile: Dockerfile
     container_name: signalgrid-forge
     environment:
-      NATS_URL: "nats://nats:4222"
+      NATS_URL: ${NATS_URL}
     depends_on:
       - nats
     restart: unless-stopped
@@ -39,8 +39,8 @@ services:
       dockerfile: Dockerfile
     container_name: signalgrid-archive
     environment:
-      NATS_URL: "nats://nats:4222"
-      DATABASE_URL: "postgres://signalgrid:signalgrid@postgres:5432/signalgrid"
+      NATS_URL: ${NATS_URL}
+      DATABASE_URL: ${DATABASE_URL}
     depends_on:
       - nats
       - postgres
@@ -52,7 +52,7 @@ services:
       dockerfile: Dockerfile
     container_name: signalgrid-forecast
     environment:
-      NATS_URL: "nats://nats:4222"
+      NATS_URL: ${NATS_URL}
     depends_on:
       - nats
     restart: unless-stopped
@@ -63,7 +63,7 @@ services:
       dockerfile: Dockerfile
     container_name: signalgrid-frontend
     environment:
-      NATS_URL: "nats://nats:4222"
+      NATS_URL: ${NATS_URL}
     depends_on:
       - nats
     ports:
@@ -75,9 +75,9 @@ services:
     image: postgres:15
     container_name: signalgrid-postgres
     environment:
-      POSTGRES_USER: signalgrid
-      POSTGRES_PASSWORD: signalgrid
-      POSTGRES_DB: signalgrid
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:

@@ -1,5 +1,34 @@
-use rand_distr::{Normal, Distribution};
+use rand_distr::StandardNormal;
 use rand::Rng;
+
+// Named constants to avoid magic numbers and improve readability
+const DEFAULT_N_REGIMES: usize = 3;
+const DEFAULT_N_CHANNELS: usize = 4;
+const DEFAULT_CORR_RANGE: f64 = 0.3;
+
+const DEFAULT_OU_THETA: [[f64; DEFAULT_N_CHANNELS]; DEFAULT_N_REGIMES] = [
+    [0.01, 0.01, 0.01, 0.01], // R0
+    [0.02, 0.02, 0.02, 0.02], // R1
+    [0.015, 0.015, 0.015, 0.015], // R2
+];
+
+const DEFAULT_OU_MU: [[f64; DEFAULT_N_CHANNELS]; DEFAULT_N_REGIMES] = [
+    [0.0, 0.0, 0.0, 0.0],
+    [1.0, 2.0, 1.0, 2.0],
+    [-2.0, -2.0, -1.0, -1.0],
+];
+
+const DEFAULT_OU_SIGMA: [[f64; DEFAULT_N_CHANNELS]; DEFAULT_N_REGIMES] = [
+    [0.2, 0.2, 0.2, 0.2],
+    [0.15, 0.15, 0.15, 0.15],
+    [0.25, 0.25, 0.25, 0.25],
+];
+
+const DEFAULT_TRANSITION_MATRIX: [[f64; DEFAULT_N_REGIMES]; DEFAULT_N_REGIMES] = [
+    [0.995, 0.002, 0.003],
+    [0.004, 0.992, 0.004],
+    [0.005, 0.0025, 0.9925],
+];
 
 pub struct IoTSensorSimulator {
     pub n_channels: usize,
@@ -14,28 +43,14 @@ pub struct IoTSensorSimulator {
 
 impl IoTSensorSimulator {
     pub fn new() -> Self {
-        let n_regimes = 3;
-        let n_channels = 4;
+        let n_regimes = DEFAULT_N_REGIMES;
+        let n_channels = DEFAULT_N_CHANNELS;
         let mut rng = rand::rng();
 
         // OU parameters per regime (main + transition)
-        let ou_theta = vec![
-            vec![0.01, 0.01, 0.01, 0.01], // R0
-            vec![0.02, 0.02, 0.02, 0.02], // R1
-            vec![0.015, 0.015, 0.015, 0.015], // R2
-        ];
-
-        let ou_mu = vec![
-            vec![0.0, 0.0, 0.0, 0.0], 
-            vec![1.0, 2.0, 1.0, 2.0],
-            vec![-2.0, -2.0, -1.0, -1.0],
-        ];
-
-        let ou_sigma = vec![
-            vec![0.2, 0.2, 0.2, 0.2],
-            vec![0.15, 0.15, 0.15, 0.15],
-            vec![0.25, 0.25, 0.25, 0.25,]
-        ];
+        let ou_theta: Vec<Vec<f64>> = DEFAULT_OU_THETA.iter().map(|r| r.to_vec()).collect();
+        let ou_mu: Vec<Vec<f64>> = DEFAULT_OU_MU.iter().map(|r| r.to_vec()).collect();
+        let ou_sigma: Vec<Vec<f64>> = DEFAULT_OU_SIGMA.iter().map(|r| r.to_vec()).collect();
 
         // Correlation matrices
         let mut corr_matrix = vec![vec![vec![0.0; n_channels]; n_channels]; n_regimes];
@@ -43,34 +58,18 @@ impl IoTSensorSimulator {
             for i in 0..n_channels {
                 corr_matrix[r][i][i] = 1.0; // diagonal
                 for j in (i+1)..n_channels {
-                    let value = rng.random_range(-0.3..0.3);
+                    let value = rng.random_range(-DEFAULT_CORR_RANGE..DEFAULT_CORR_RANGE);
                     corr_matrix[r][i][j] = value;
                     corr_matrix[r][j][i] = value; // mirror
                 }
             }
         }
 
-        // Transition matrix: main -> self or transition, transition -> next main
+        // Transition matrix
         let mut transition_matrix = vec![vec![0.0; n_regimes]; n_regimes];
-
-        // --- Main regimes: R0..R2 ---
-        transition_matrix[0] = vec![
-            0.995,                   // cannot go to T0
-            0.002,                  // R0 -> T1
-            0.003,                 // R0 -> T2
-        ];
-
-        transition_matrix[1] = vec![
-            0.004,
-            0.992, // stay in R1
-            0.004
-        ];
-
-        transition_matrix[2] = vec![
-            0.005,
-            0.0025,
-            0.9925
-        ];
+        for r in 0..n_regimes {
+            transition_matrix[r] = DEFAULT_TRANSITION_MATRIX[r].to_vec();
+        }
 
         let state = ou_mu[0].clone();
 
@@ -89,12 +88,11 @@ impl IoTSensorSimulator {
 
     pub fn step(&mut self) -> Vec<f64> {
         let mut rng = rand::rng();
-        let normal = Normal::new(0.0, 1.0).unwrap();
 
-        // --- Generate correlated noise ---
+        // --- Generate correlated noise using StandardNormal (no fallible constructor) ---
         let mut noise = vec![0.0; self.n_channels];
         for i in 0..self.n_channels {
-            noise[i] = normal.sample(&mut rng);
+            noise[i] = rng.sample(StandardNormal);
         }
 
         let mut correlated_noise = vec![0.0; self.n_channels];
@@ -112,7 +110,7 @@ impl IoTSensorSimulator {
         }
 
 
-        let mut probs = self.transition_matrix[self.regime_idx].clone();
+        let probs = self.transition_matrix[self.regime_idx].clone();
         
 
         // Sample next regime
@@ -133,4 +131,33 @@ impl IoTSensorSimulator {
         self.state.clone()
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulator_initializes_expected_shape() {
+        let simulator = IoTSensorSimulator::new();
+        assert_eq!(simulator.n_channels, 4);
+        assert_eq!(simulator.regime_idx, 0);
+        assert_eq!(simulator.state.len(), simulator.n_channels);
+    }
+
+    #[test]
+    fn step_returns_one_value_per_channel() {
+        let mut simulator = IoTSensorSimulator::new();
+        let sample = simulator.step();
+        assert_eq!(sample.len(), simulator.n_channels);
+    }
+
+    #[test]
+    fn step_keeps_regime_in_valid_range() {
+        let mut simulator = IoTSensorSimulator::new();
+        for _ in 0..200 {
+            let _ = simulator.step();
+            assert!(simulator.regime_idx < 3);
+        }
+    }
 }

@@ -1,0 +1,12 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+.github/
+.pytest_cache/
+
+# Rust build artifacts
+**/target/
+
+# Editor artifacts
+.vscode/

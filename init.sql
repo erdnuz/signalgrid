@@ -10,3 +10,6 @@ CREATE TABLE IF NOT EXISTS stats (
     count BIGINT NOT NULL,
     timestamp BIGINT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_stats_station_sensor_ts ON stats(station, sensor, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats(timestamp DESC);

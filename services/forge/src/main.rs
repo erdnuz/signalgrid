@@ -1,51 +1,53 @@
 use async_nats::ConnectOptions;
 use bytes::Bytes;
+use forge::{aggregate_stats, Event, Stats};
 use futures::stream::StreamExt;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::env;
+use anyhow::Context;
+use tokio::sync::watch;
 use tokio::time::{self, Duration};
 use chrono::Utc;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Event {
-    timestamp: u64,
-    values: Vec<f64>, // array of sensor values
-    station: String,
-}
+const INITIAL_AGGREGATION_DELAY_SECS: u64 = 5;
+const AGGREGATION_INTERVAL_MS: u64 = 400;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Stats {
-    station: String,
-    sensor: usize,
-    mean: f64,
-    min: f64,
-    max: f64,
-    count: usize,
-    timestamp: u64,
-}
+use tracing::{info, error};
+use tracing_subscriber;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let nats_url = "nats://nats:4222";
-    let client = ConnectOptions::new().connect(nats_url).await?;
-    println!("Forge connected to NATS at {}", nats_url);
+    tracing_subscriber::fmt::init();
+
+    let nats_url = env::var("NATS_URL").context("NATS_URL environment variable must be set")?;
+    let client = ConnectOptions::new().connect(&nats_url).await?;
+    info!(service = "forge", event = "nats_connected", %nats_url);
 
     let stats_history: Arc<tokio::sync::Mutex<Vec<Stats>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let mut sub = client.subscribe("events").await?;
     let stats_history_clone = stats_history.clone();
     let client_clone = client.clone();
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-    tokio::spawn(async move {
+    let aggregation_task = tokio::spawn(async move {
         let mut buffer: Vec<Event> = Vec::new();
-        let mut sleep = Box::pin(time::sleep(Duration::from_secs(5)));
+        let mut sleep = Box::pin(time::sleep(Duration::from_secs(INITIAL_AGGREGATION_DELAY_SECS)));
 
         loop {
             tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && *shutdown_rx.borrow() {
+                        info!(service = "forge", event = "stopping_aggregation");
+                        break;
+                    }
+                }
+
                 maybe_msg = sub.next() => {
                     if let Some(msg) = maybe_msg {
                         if let Ok(event) = serde_json::from_slice::<Event>(&msg.payload) {
                             buffer.push(event);
+                        } else {
+                            error!(service = "forge", event = "parse_event_failed");
                         }
                     }
                 }
@@ -53,34 +55,7 @@ async fn main() -> anyhow::Result<()> {
                 _ = &mut sleep => {
                     if !buffer.is_empty() {
                         let now_ms = Utc::now().timestamp_millis() as u64;
-                        let cutoff_ms = now_ms.saturating_sub(600); // 30 seconds in ms
-                        buffer.retain(|e| e.timestamp > cutoff_ms);
-
-                        // Aggregate stats per sensor index
-                        let mut map: HashMap<(String, usize), Vec<f64>> = HashMap::new();
-                        for e in &buffer {
-                            for (i, &value) in e.values.iter().enumerate() {
-                                map.entry((e.station.clone(), i)).or_default().push(value);
-                            }
-                        }
-
-                        let mut stats_to_publish = Vec::new();
-                        for ((station, sensor), values) in map {
-                            let count = values.len();
-                            let min = *values.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-                            let max = *values.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-                            let mean = values.iter().sum::<f64>() / count as f64;
-
-                            stats_to_publish.push(Stats {
-                                station: station.clone(),
-                                sensor,
-                                mean,
-                                min,
-                                max,
-                                count,
-                                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                            });
-                        }
+                        let stats_to_publish = aggregate_stats(&buffer, now_ms);
 
                         // Store history
                         {
@@ -90,22 +65,34 @@ async fn main() -> anyhow::Result<()> {
 
                         // Publish stats
                         for stat in stats_to_publish {
-                            let payload: Bytes = serde_json::to_vec(&stat).unwrap().into();
-                            if let Err(e) = client_clone.publish("stats", payload).await {
-                                eprintln!("Failed to publish stats: {:?}", e);
+                            match serde_json::to_vec(&stat) {
+                                Ok(encoded) => {
+                                    let payload: Bytes = encoded.into();
+                                    if let Err(e) = client_clone.publish("stats", payload).await {
+                                        error!(service = "forge", event = "publish_stats_failed", error = %e);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(service = "forge", event = "encode_stats_failed", error = %e);
+                                }
                             }
-
                         }
                     }
 
                     // Reset sleep
-                    sleep = Box::pin(time::sleep(Duration::from_millis(400)));
+                    sleep = Box::pin(time::sleep(Duration::from_millis(AGGREGATION_INTERVAL_MS)));
                 }
             }
         }
     });
 
     tokio::signal::ctrl_c().await?;
-    println!("Shutting down...");
+    info!(service = "forge", event = "signal_received", signal = "ctrl_c");
+    let _ = shutdown_tx.send(true);
+
+    if let Err(e) = aggregation_task.await {
+        error!(service = "forge", event = "task_join_error", error = %e);
+    }
+
     Ok(())
 }
