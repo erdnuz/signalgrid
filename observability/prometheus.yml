@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: signalgrid
+    static_configs:
+      - targets: ["pulse:9000", "forge:9000", "archive:9000", "forecast:9000"]
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: service

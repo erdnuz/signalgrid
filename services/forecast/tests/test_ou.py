@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.stats import t
 
 from signalgrid_forecast import ou
 
@@ -72,3 +73,28 @@ def test_forecast_ou_interval_widens_with_horizon():
     _, ci = ou.forecast_ou(list(values), n_steps=5)
     widths = [upper - lower for lower, upper in ci]
     assert widths == sorted(widths)
+
+
+def test_interval_stays_bounded_near_a_unit_root():
+    # Regression: with phi-hat ~ 1 the implied mean c / (1 - phi) is unstable;
+    # an earlier (phi, mu) delta method ignored their covariance and produced
+    # intervals hundreds of times wider than usual.
+    rng = np.random.default_rng(11)
+    walk = np.cumsum(rng.standard_normal(60)) * 0.1  # random walk: phi = 1
+    forecasts, ci = ou.forecast_ou(list(walk), n_steps=3)
+    assert forecasts is not None
+    widths = [hi - lo for lo, hi in ci]
+    assert max(widths) < 20 * 0.1 * 3  # a few innovation s.d., not hundreds
+
+
+def test_one_step_variance_matches_textbook_ols_prediction_interval():
+    x = _simulate_ar1(phi=0.6, mu=1.0, sigma=0.3, n=80, seed=5)
+    _, ci = ou.forecast_ou(list(x), n_steps=1)
+    xt, xp = x[:-1], x[1:]
+    n = len(xt)
+    b, a = np.polyfit(xt, xp, 1)
+    s2 = np.sum((xp - (a + b * xt)) ** 2) / (n - 2)
+    se = np.sqrt(s2 * (1 + 1 / n + (x[-1] - xt.mean()) ** 2 / np.sum((xt - xt.mean()) ** 2)))
+    half = t.ppf(0.99, n - 2) * se
+    lo, hi = ci[0]
+    assert np.isclose(hi - lo, 2 * half)

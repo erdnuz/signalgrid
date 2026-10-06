@@ -22,3 +22,10 @@ def test_forecast_contract_round_trips(contract):
 def test_regime_contract_round_trips(contract):
     payload = contract("regime.json")
     assert RegimeMessage.model_validate(payload).model_dump(mode="json") == payload
+
+
+def test_alert_contract_round_trips(contract):
+    from signalgrid_forecast.models import AlertMessage
+
+    payload = contract("alert.json")
+    assert AlertMessage.model_validate(payload).model_dump(mode="json") == payload

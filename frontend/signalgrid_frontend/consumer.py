@@ -12,7 +12,7 @@ from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
 from pydantic import BaseModel, ValidationError
 
-from .models import ForecastMessage, RegimeMessage, Stats
+from .models import AlertMessage, ForecastMessage, RegimeMessage, Stats
 from .store import DataStore, Key
 
 logger = logging.getLogger("frontend.consumer")
@@ -78,4 +78,5 @@ class Consumer:
         await nc.subscribe("sg.stats.>", cb=self._handler(Stats, self.handle_stats))
         await nc.subscribe("sg.forecasts.>", cb=self._handler(ForecastMessage, self.store.add_forecast))
         await nc.subscribe("sg.regimes.>", cb=self._handler(RegimeMessage, self.store.add_regime))
+        await nc.subscribe("sg.alerts.>", cb=self._handler(AlertMessage, self.store.add_alert))
         await asyncio.Event().wait()  # run for the life of the process

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
 
 
@@ -21,9 +23,11 @@ class Stats(_Message):
     regime: int | None = None
 
 
-class ForecastMetrics(_Message):
+class HorizonMetrics(_Message):
+    horizon: int
     n: int
     mae: float | None
+    mase: float | None
     coverage: float | None
 
 
@@ -37,7 +41,7 @@ class ForecastMessage(_Message):
     lower_ci: list[float]
     upper_ci: list[float]
     confidence: float
-    metrics: ForecastMetrics
+    metrics: list[HorizonMetrics]
 
 
 class RegimeMessage(_Message):
@@ -49,3 +53,18 @@ class RegimeMessage(_Message):
     mapped_state: int | None
     accuracy: float | None
     n_scored: int
+
+
+Severity = Literal["info", "warning", "serious", "critical"]
+
+
+class AlertMessage(_Message):
+    id: str
+    rule: str
+    severity: Severity
+    state: Literal["firing", "resolved"]
+    station: str
+    sensor: int | None
+    timestamp: int
+    message: str
+    value: float | None = None

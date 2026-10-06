@@ -1,0 +1,11 @@
+{
+  "id": "anomaly:StationA:2:1700000000500",
+  "rule": "anomaly",
+  "severity": "warning",
+  "state": "firing",
+  "station": "StationA",
+  "sensor": 2,
+  "timestamp": 1700000000500,
+  "message": "Window mean 2.31 outside the forecast interval [1.10, 1.90]",
+  "value": 2.31
+}

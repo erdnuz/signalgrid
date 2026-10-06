@@ -1,4 +1,4 @@
-from signalgrid_frontend.models import ForecastMessage, ForecastMetrics, RegimeMessage, Stats
+from signalgrid_frontend.models import AlertMessage, ForecastMessage, HorizonMetrics, RegimeMessage, Stats
 
 
 def stats(ts: int, mean: float = 1.0, station: str = "StationA", sensor: int = 0) -> Stats:
@@ -26,7 +26,10 @@ def forecast(origin: int, station: str = "StationA", sensor: int = 0) -> Forecas
         lower_ci=[0.5, 0.5, 0.5],
         upper_ci=[1.5, 1.6, 1.7],
         confidence=0.98,
-        metrics=ForecastMetrics(n=10, mae=0.1, coverage=0.97),
+        metrics=[
+            HorizonMetrics(horizon=1, n=30, mae=0.1, mase=0.9, coverage=0.97),
+            HorizonMetrics(horizon=3, n=28, mae=0.2, mase=0.8, coverage=0.99),
+        ],
     )
 
 
@@ -40,4 +43,17 @@ def regime(ts: int, true: int, mapped: int, station: str = "StationA") -> Regime
         mapped_state=mapped,
         accuracy=0.9,
         n_scored=100,
+    )
+
+
+def alert(rule="anomaly", severity="warning", state="firing", station="StationA", sensor=0, ts=0):
+    return AlertMessage(
+        id=f"{rule}:{station}:{sensor}:{ts}",
+        rule=rule,
+        severity=severity,
+        state=state,
+        station=station,
+        sensor=sensor,
+        timestamp=ts,
+        message="test",
     )

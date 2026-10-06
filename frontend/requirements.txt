@@ -4,3 +4,4 @@ nats-py==2.16.0
 pydantic==2.13.5
 requests==2.34.2
 gunicorn==26.2.0
+numpy==2.5.3

@@ -1,23 +1,24 @@
 use async_nats::jetstream::{self, message::PublishMessage};
 use chrono::Utc;
 use forge::{Ingest, WindowAggregator};
-use futures::future::join_all;
-use futures::StreamExt;
+use futures::future::{join_all, BoxFuture};
+use futures::{FutureExt, StreamExt};
 use metrics::{counter, gauge, histogram};
 use signalgrid_core::config::{connect_nats, env_or};
 use signalgrid_core::subjects::{self, ensure_stats_stream};
 use signalgrid_core::telemetry::{init_metrics, init_tracing};
 use signalgrid_core::{shutdown_signal, RawEvent, Stats};
 use std::future::IntoFuture;
-use tokio::time::{self, Duration, Instant, MissedTickBehavior};
+use tokio::time::{self, Duration, MissedTickBehavior};
 use tracing::{error, info, warn};
 
-/// Publishes closed windows to JetStream. The window identity is sent as
+/// Sends closed windows to JetStream and returns a future that resolves once
+/// the server has acknowledged them. The window identity is sent as
 /// `Nats-Msg-Id`, so a re-publish after a crash is de-duplicated by the server.
-async fn publish(js: &jetstream::Context, stats: Vec<Stats>) {
-    if stats.is_empty() {
-        return;
-    }
+///
+/// Sending only enqueues the messages; waiting for the acks is left to the
+/// caller so the hot path never blocks on a broker round trip.
+async fn publish(js: &jetstream::Context, stats: Vec<Stats>) -> BoxFuture<'static, ()> {
     let now_ms = Utc::now().timestamp_millis();
     let mut acks = Vec::with_capacity(stats.len());
 
@@ -38,7 +39,7 @@ async fn publish(js: &jetstream::Context, stats: Vec<Stats>) {
             .send_publish(subjects::stats(&stat.station, stat.sensor), message)
             .await
         {
-            Ok(ack) => acks.push(ack),
+            Ok(ack) => acks.push(ack.into_future()),
             Err(e) => {
                 counter!("forge_publish_failures_total").increment(1);
                 error!(event = "publish_stats_failed", error = %e);
@@ -46,16 +47,19 @@ async fn publish(js: &jetstream::Context, stats: Vec<Stats>) {
         }
     }
 
-    for result in join_all(acks.into_iter().map(IntoFuture::into_future)).await {
-        match result {
-            Ok(ack) if ack.duplicate => counter!("forge_publish_duplicates_total").increment(1),
-            Ok(_) => counter!("forge_stats_published_total").increment(1),
-            Err(e) => {
-                counter!("forge_publish_failures_total").increment(1);
-                error!(event = "publish_ack_failed", error = %e);
+    async move {
+        for result in join_all(acks).await {
+            match result {
+                Ok(ack) if ack.duplicate => counter!("forge_publish_duplicates_total").increment(1),
+                Ok(_) => counter!("forge_stats_published_total").increment(1),
+                Err(e) => {
+                    counter!("forge_publish_failures_total").increment(1);
+                    error!(event = "publish_ack_failed", error = %e);
+                }
             }
         }
     }
+    .boxed()
 }
 
 #[tokio::main]
@@ -64,9 +68,11 @@ async fn main() -> anyhow::Result<()> {
     init_metrics()?;
 
     let window_ms: i64 = env_or("WINDOW_MS", 500)?;
-    let lateness_ms: i64 = env_or("ALLOWED_LATENESS_MS", 200)?;
-    // Close everything if input stops, so the last windows are not held forever.
-    let idle_flush = Duration::from_millis(env_or("IDLE_FLUSH_MS", 2_000)?);
+    // Per-station streams arrive in order, so no lateness is needed unless
+    // producers are merged upstream or clocks are not monotonic.
+    let lateness_ms: i64 = env_or("ALLOWED_LATENESS_MS", 0)?;
+    // Flush a station whose input stopped, so its last window is not held forever.
+    let idle_ms: i64 = env_or("IDLE_FLUSH_MS", 2_000)?;
 
     let client = connect_nats("forge").await?;
     let js = jetstream::new(client.clone());
@@ -80,9 +86,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut agg = WindowAggregator::new(window_ms, lateness_ms);
-    let mut ticker = time::interval(Duration::from_millis((window_ms as u64 / 5).max(10)));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last_event = Instant::now();
+    let mut idle_ticker = time::interval(Duration::from_millis(idle_ms.max(100) as u64 / 2));
+    idle_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -95,38 +100,40 @@ async fn main() -> anyhow::Result<()> {
                     warn!(event = "subscription_closed");
                     break;
                 };
-                match serde_json::from_slice::<RawEvent>(&msg.payload) {
-                    Ok(event) => {
-                        last_event = Instant::now();
-                        match agg.ingest(&event) {
-                            Ingest::Accepted { dropped_values } => {
-                                counter!("forge_events_total").increment(1);
-                                counter!("forge_non_finite_values_total").increment(dropped_values as u64);
-                            }
-                            Ingest::Late => counter!("forge_late_events_total").increment(1),
-                        }
-                    }
+                let event = match serde_json::from_slice::<RawEvent>(&msg.payload) {
+                    Ok(event) => event,
                     Err(e) => {
                         counter!("forge_parse_errors_total").increment(1);
                         error!(event = "parse_event_failed", error = %e);
+                        continue;
                     }
+                };
+                match agg.ingest(&event) {
+                    Ingest::Accepted { dropped_values } => {
+                        counter!("forge_events_total").increment(1);
+                        counter!("forge_non_finite_values_total").increment(dropped_values as u64);
+                    }
+                    Ingest::Late => counter!("forge_late_events_total").increment(1),
+                }
+                // Emit as soon as this event completes a window, not on a timer.
+                let ready = agg.close_ready();
+                if !ready.is_empty() {
+                    tokio::spawn(publish(&js, ready).await);
                 }
             }
 
-            _ = ticker.tick() => {
-                let ready = if last_event.elapsed() > idle_flush {
-                    agg.close_all()
-                } else {
-                    agg.close_ready()
-                };
-                publish(&js, ready).await;
+            _ = idle_ticker.tick() => {
+                let stale = agg.close_idle(Utc::now().timestamp_millis(), idle_ms);
+                if !stale.is_empty() {
+                    tokio::spawn(publish(&js, stale).await);
+                }
                 gauge!("forge_open_windows").set(agg.open_windows() as f64);
             }
         }
     }
 
     info!(event = "draining", open_windows = agg.open_windows());
-    publish(&js, agg.close_all()).await;
+    publish(&js, agg.close_all()).await.await;
     client.flush().await?;
     Ok(())
 }

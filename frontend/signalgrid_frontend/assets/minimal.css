@@ -1,17 +1,46 @@
-/* SignalGrid dashboard. Surface and ink tokens match the chart palette in figures.py. */
+/* SignalGrid dashboard. Surface and ink tokens match the chart palette in charts.py. */
 :root {
   color-scheme: dark;
   --page: #0d0d0d;
   --surface: #1a1a19;
   --surface-raised: #222220;
+  --surface-hover: #262624;
   --ink: #ffffff;
   --ink-secondary: #c3c2b7;
   --ink-muted: #898781;
   --hairline: rgba(255, 255, 255, 0.10);
+  --stroke: rgba(255, 255, 255, 0.18);
   --focus: #3987e5;
+  --accent-wash: rgba(57, 135, 229, 0.18);
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
   --radius: 12px;
   --gap: 16px;
+  --control-h: 40px;
   --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Dash 4 themes its components through --Dash-* custom properties defined
+ * on :root (light by default). `html:root` out-specifies them regardless of
+ * stylesheet order. Set at the root because dropdown menus render in a
+ * portal outside the controls. */
+html:root {
+  --Dash-Fill-Inverse-Strong: var(--surface);
+  --Dash-Text-Strong: var(--ink);
+  --Dash-Text-Primary: var(--ink);
+  --Dash-Text-Weak: var(--ink-secondary);
+  --Dash-Text-Disabled: var(--ink-muted);
+  --Dash-Stroke-Strong: var(--stroke);
+  --Dash-Stroke-Weak: var(--hairline);
+  --Dash-Fill-Disabled: rgba(255, 255, 255, 0.06);
+  --Dash-Fill-Interactive-Strong: var(--focus);
+  --Dash-Fill-Interactive-Weak: var(--accent-wash);
+  --Dash-Fill-Primary-Hover: rgba(255, 255, 255, 0.06);
+  --Dash-Fill-Primary-Active: rgba(57, 135, 229, 0.22);
+  --Dash-Shading-Strong: rgba(0, 0, 0, 0.6);
+  --Dash-Shading-Weak: rgba(0, 0, 0, 0.35);
 }
 
 html, body {
@@ -25,7 +54,7 @@ html, body {
 
 .container {
   box-sizing: border-box;
-  max-width: 1180px;
+  max-width: 1320px;
   margin: 0 auto;
   padding: 32px var(--gap) 48px;
   display: flex;
@@ -33,32 +62,21 @@ html, body {
   gap: var(--gap);
 }
 
-.title {
-  margin: 0;
-  font-size: 1.75rem;
-  font-weight: 700;
-  letter-spacing: -0.01em;
-}
-
-.subtitle {
-  margin: 4px 0 0;
-  color: var(--ink-secondary);
-  font-size: 0.95rem;
-}
+.title { margin: 0; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.01em; }
+.subtitle { margin: 4px 0 0; color: var(--ink-secondary); font-size: 0.95rem; }
 
 /* ---- controls ---- */
 .controls {
   display: flex;
   flex-wrap: wrap;
+  align-items: flex-end;
   gap: var(--gap);
 }
 
-.control {
-  flex: 1 1 220px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
+.control { display: flex; flex-direction: column; gap: 6px; }
+.control-select { flex: 1 1 220px; min-width: 0; }
+.control-seg { flex: 0 0 auto; }
+.hidden { display: none; }
 
 .label {
   color: var(--ink-muted);
@@ -67,31 +85,53 @@ html, body {
   letter-spacing: 0.06em;
 }
 
-/* Dash dropdown (react-select) on the dark surface */
-.control .Select-control,
-.control .dash-dropdown {
-  background: var(--surface) !important;
-  border: 1px solid var(--hairline) !important;
-  border-radius: 8px !important;
-  color: var(--ink) !important;
+.control .dash-dropdown { min-height: var(--control-h); border-radius: 8px; }
+.dash-dropdown-content { border-radius: 8px; }
+.dash-dropdown-option { cursor: pointer; }
+
+/* Segmented control: every option is a full-height button, so the hover and
+ * selected states always cover exactly the same box. */
+.segmented {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 2px;
+  height: var(--control-h);
+  padding: 3px;
+  box-sizing: border-box;
+  background: var(--surface);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
 }
-.control .Select-value-label,
-.control .Select-placeholder,
-.control .Select-input > input { color: var(--ink) !important; }
-.control .Select-menu-outer {
-  background: var(--surface-raised) !important;
-  border: 1px solid var(--hairline) !important;
+
+.seg-btn {
+  min-width: 56px;
+  padding: 0 14px;
+  margin: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: background-color 0.12s, color 0.12s;
 }
-.control .VirtualizedSelectOption,
-.control .Select-option { background: var(--surface-raised) !important; color: var(--ink-secondary) !important; }
-.control .VirtualizedSelectFocusedOption,
-.control .Select-option.is-focused { background: #2c2c2a !important; color: var(--ink) !important; }
-.control .is-focused:not(.is-open) > .Select-control { border-color: var(--focus) !important; }
+
+.seg-btn:hover { background: var(--surface-hover); color: var(--ink); }
+
+.seg-btn.selected {
+  background: var(--accent-wash);
+  color: var(--ink);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--focus);
+}
+
+.seg-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 
 /* ---- KPI tiles ---- */
 .kpis {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
 }
 
@@ -102,35 +142,103 @@ html, body {
   padding: 14px 16px;
 }
 
-.kpi-label {
-  color: var(--ink-secondary);
-  font-size: 0.85rem;
-}
+.kpi-label { color: var(--ink-secondary); font-size: 0.85rem; }
+.kpi-value { margin-top: 6px; font-size: 1.5rem; font-weight: 650; white-space: nowrap; }
+.kpi-note { margin-top: 2px; color: var(--ink-muted); font-size: 0.75rem; }
 
-.kpi-value {
-  margin-top: 6px;
-  font-size: 1.6rem;
-  font-weight: 650;
-}
-
-.kpi-note {
-  margin-top: 2px;
-  color: var(--ink-muted);
-  font-size: 0.75rem;
-}
-
-/* ---- chart ---- */
-.chart {
+/* ---- charts ---- */
+.chart,
+.panel {
   background: var(--surface);
   border: 1px solid var(--hairline);
   border-radius: var(--radius);
   overflow: hidden;
-  height: 620px;
+  padding-top: 14px;
+  min-width: 0;
+}
+
+.panel-title { margin: 0 16px; font-size: 0.95rem; font-weight: 600; }
+.panel-note { margin: 2px 16px 4px; color: var(--ink-muted); font-size: 0.78rem; }
+
+.main-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: var(--gap);
+  align-items: stretch;
+}
+
+.panels {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gap);
+}
+
+/* ---- alerts ---- */
+.alerts { display: flex; flex-direction: column; max-height: 680px; }
+
+.alert-feed {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.alert-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+  width: 100%;
+  padding: 8px;
+  border: 0;
+  border-left: 3px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.alert-row:hover { background: var(--surface-hover); }
+.alert-row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+
+.alert-icon { font-size: 0.85rem; line-height: 1.35; text-align: center; }
+.alert-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.alert-title { font-size: 0.85rem; font-weight: 600; }
+.alert-scope { color: var(--ink-secondary); font-size: 0.78rem; }
+.alert-message { color: var(--ink-muted); font-size: 0.78rem; overflow-wrap: anywhere; }
+.alert-time { color: var(--ink-muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.alert-empty { margin: 8px; color: var(--ink-muted); font-size: 0.85rem; }
+
+/* Status colour marks the icon and the edge; the text label always says it too. */
+.sev-info .alert-icon { color: var(--ink-secondary); }
+.sev-info { border-left-color: var(--stroke); }
+.sev-warning .alert-icon, .sev-warning .alert-severity { color: var(--status-warning); }
+.sev-warning { border-left-color: var(--status-warning); }
+.sev-serious .alert-icon, .sev-serious .alert-severity { color: var(--status-serious); }
+.sev-serious { border-left-color: var(--status-serious); }
+.sev-critical .alert-icon, .sev-critical .alert-severity { color: var(--status-critical); }
+.sev-critical { border-left-color: var(--status-critical); }
+.sev-resolved .alert-icon, .sev-resolved .alert-severity { color: var(--status-good); }
+.sev-resolved { border-left-color: var(--status-good); }
+
+@media (max-width: 1080px) {
+  .main-row { grid-template-columns: minmax(0, 1fr); }
+  .alerts { max-height: 360px; }
+}
+
+@media (max-width: 860px) {
+  .panels { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 640px) {
   .container { padding-top: 20px; }
   .title { font-size: 1.4rem; }
-  .chart { height: 480px; }
-  .kpi-value { font-size: 1.35rem; }
+  .kpi-value { font-size: 1.25rem; }
+  .control-seg { flex: 1 1 100%; }
+  .segmented { width: 100%; }
+  .seg-btn { flex: 1; min-width: 0; }
 }

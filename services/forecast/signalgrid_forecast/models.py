@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -30,11 +32,13 @@ class Stats(_Message):
     regime: int | None = None
 
 
-class ForecastMetrics(_Message):
-    """Rolling out-of-sample quality of 1-step-ahead forecasts."""
+class HorizonMetrics(_Message):
+    """Rolling out-of-sample quality of h-step-ahead forecasts."""
 
+    horizon: int  # windows ahead
     n: int
     mae: float | None
+    mase: float | None  # model MAE / persistence MAE at the same horizon; < 1 beats it
     coverage: float | None  # share of actuals inside the interval
 
 
@@ -48,7 +52,7 @@ class ForecastMessage(_Message):
     lower_ci: list[float]
     upper_ci: list[float]
     confidence: float
-    metrics: ForecastMetrics
+    metrics: list[HorizonMetrics]  # one entry per evaluated horizon, ascending
 
     @field_validator("forecasts", "lower_ci", "upper_ci")
     @classmethod
@@ -69,6 +73,25 @@ class RegimeMessage(_Message):
     n_scored: int
 
 
+Severity = Literal["info", "warning", "serious", "critical"]
+
+
+class AlertMessage(_Message):
+    """A state change of an alert rule. `firing` alerts stay active until a
+    matching `resolved` message (same `rule` and scope) arrives; one-shot
+    events (anomalies, regime changes) are sent as `firing` only."""
+
+    id: str
+    rule: Literal["anomaly", "calibration", "model_degraded", "regime_change", "regime_accuracy"]
+    severity: Severity
+    state: Literal["firing", "resolved"]
+    station: str
+    sensor: int | None
+    timestamp: int
+    message: str
+    value: float | None = None
+
+
 def subject_token(value: str | int) -> str:
     token = str(value)
     if not token or any(c in token for c in ". *>"):
@@ -82,3 +105,7 @@ def forecast_subject(station: str, sensor: int) -> str:
 
 def regime_subject(station: str) -> str:
     return f"sg.regimes.{subject_token(station)}"
+
+
+def alert_subject(station: str) -> str:
+    return f"sg.alerts.{subject_token(station)}"

@@ -5,7 +5,7 @@ use pulse::simulator::IoTSensorSimulator;
 use signalgrid_core::config::{connect_nats, env_or};
 use signalgrid_core::telemetry::{init_metrics, init_tracing};
 use signalgrid_core::{shutdown_signal, subjects, RawEvent};
-use tokio::time::{Duration, MissedTickBehavior};
+use tokio::time::Duration;
 use tracing::{error, info};
 
 struct Station {
@@ -55,15 +55,26 @@ async fn main() -> anyhow::Result<()> {
         seeded = seed.is_some()
     );
 
-    let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Sample just after each wall-clock grid point (multiples of the
+    // interval). Forge's windows sit on the same grid, so the sample taken
+    // right after a window boundary is what tells forge the previous window
+    // is complete; with free-running ticks it would arrive up to one interval
+    // late, adding that much end-to-end latency.
+    //
+    // Samples carry their *actual* timestamp: snapping it to the grid would
+    // stamp late ticks in the future (and show up downstream as negative
+    // latency). Each deadline is recomputed from the wall clock, so drift
+    // between the monotonic and wall clocks cannot accumulate.
+    let step = interval_ms as i64;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
+        let now_ms = Utc::now().timestamp_millis();
+        let wait = next_tick_after(now_ms, step) - now_ms;
         tokio::select! {
             _ = &mut shutdown => break,
-            _ = interval.tick() => {}
+            _ = tokio::time::sleep(Duration::from_millis(wait as u64)) => {}
         }
 
         let timestamp = Utc::now().timestamp_millis();
@@ -96,9 +107,26 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Margin after a grid point, so a timer that fires marginally early still
+/// samples inside the new window.
+const TICK_OFFSET_MS: i64 = 1;
+
+/// Next sampling instant strictly after `now_ms`: a grid point plus the offset.
+fn next_tick_after(now_ms: i64, step: i64) -> i64 {
+    (now_ms - TICK_OFFSET_MS).div_euclid(step) * step + step + TICK_OFFSET_MS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticks_land_just_after_grid_points() {
+        assert_eq!(next_tick_after(1_000, 100), 1_001);
+        assert_eq!(next_tick_after(1_001, 100), 1_101);
+        assert_eq!(next_tick_after(1_050, 100), 1_101);
+        assert_eq!(next_tick_after(1_100, 100), 1_101);
+    }
 
     #[test]
     fn station_names_are_valid_subject_tokens() {

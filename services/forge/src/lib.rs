@@ -1,15 +1,21 @@
-//! Event-time tumbling-window aggregation.
+//! Event-time tumbling-window aggregation with per-station watermarks.
 //!
 //! Windows are aligned to multiples of `window_ms` on the event timestamp, so
 //! every sample belongs to exactly one window regardless of when it arrives.
-//! A window is closed once the watermark (max event time seen minus the
-//! allowed lateness) passes its end. Events for an already-closed window are
-//! reported as late and dropped. Each open window holds only O(1) running
-//! accumulators per (station, sensor), so memory is bounded by the number of
-//! open windows rather than by the event rate.
+//!
+//! Each station has its own watermark (latest event time seen from that
+//! station minus the allowed lateness). NATS delivers one publisher's messages
+//! on a subject in order, so a station's window is complete as soon as that
+//! station's first sample of a later window arrives; with zero lateness it is
+//! emitted immediately instead of waiting on a global watermark that the
+//! slowest station holds back. Events for an already-closed window are
+//! reported as late and dropped.
+//!
+//! Each open window holds O(1) running accumulators per sensor, so memory is
+//! bounded by the number of open windows rather than by the event rate.
 
 use signalgrid_core::{RawEvent, Stats};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy)]
 struct Accumulator {
@@ -39,9 +45,17 @@ impl Accumulator {
 
 #[derive(Debug, Default)]
 struct Window {
-    sensors: BTreeMap<(String, u32), Accumulator>,
-    /// Ground-truth regime counts per station.
-    regimes: BTreeMap<String, BTreeMap<u8, u32>>,
+    sensors: BTreeMap<u32, Accumulator>,
+    /// Ground-truth regime counts.
+    regimes: BTreeMap<u8, u32>,
+}
+
+#[derive(Debug, Default)]
+struct StationState {
+    open: BTreeMap<i64, Window>,
+    max_event_ts: Option<i64>,
+    /// Windows starting before this are closed; events for them are late.
+    closed_before: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,10 +70,7 @@ pub enum Ingest {
 pub struct WindowAggregator {
     window_ms: i64,
     allowed_lateness_ms: i64,
-    open: BTreeMap<i64, Window>,
-    max_event_ts: Option<i64>,
-    /// Windows starting before this are closed; events for them are late.
-    closed_before: i64,
+    stations: HashMap<String, StationState>,
 }
 
 impl WindowAggregator {
@@ -69,9 +80,7 @@ impl WindowAggregator {
         Self {
             window_ms,
             allowed_lateness_ms,
-            open: BTreeMap::new(),
-            max_event_ts: None,
-            closed_before: i64::MIN,
+            stations: HashMap::new(),
         }
     }
 
@@ -84,21 +93,24 @@ impl WindowAggregator {
     }
 
     pub fn open_windows(&self) -> usize {
-        self.open.len()
+        self.stations.values().map(|s| s.open.len()).sum()
     }
 
-    pub fn watermark(&self) -> Option<i64> {
-        self.max_event_ts
+    pub fn watermark(&self, station: &str) -> Option<i64> {
+        self.stations
+            .get(station)?
+            .max_event_ts
             .map(|ts| ts.saturating_sub(self.allowed_lateness_ms))
     }
 
     pub fn ingest(&mut self, event: &RawEvent) -> Ingest {
         let start = self.window_start(event.timestamp);
-        if start < self.closed_before {
+        let state = self.stations.entry(event.station.clone()).or_default();
+        if state.closed_before.is_some_and(|bound| start < bound) {
             return Ingest::Late;
         }
 
-        let window = self.open.entry(start).or_default();
+        let window = state.open.entry(start).or_default();
         let mut dropped_values = 0;
         for (sensor, &value) in event.values.iter().enumerate() {
             if !value.is_finite() {
@@ -107,68 +119,94 @@ impl WindowAggregator {
             }
             window
                 .sensors
-                .entry((event.station.clone(), sensor as u32))
+                .entry(sensor as u32)
                 .and_modify(|acc| acc.push(value))
                 .or_insert_with(|| Accumulator::new(value));
         }
         if let Some(regime) = event.regime {
-            *window
-                .regimes
-                .entry(event.station.clone())
-                .or_default()
-                .entry(regime)
-                .or_default() += 1;
+            *window.regimes.entry(regime).or_default() += 1;
         }
 
-        self.max_event_ts = Some(
-            self.max_event_ts
+        state.max_event_ts = Some(
+            state
+                .max_event_ts
                 .map_or(event.timestamp, |m| m.max(event.timestamp)),
         );
         Ingest::Accepted { dropped_values }
     }
 
-    /// Closes and returns every window whose end is at or before the watermark.
+    /// Closes and returns, per station, every window whose end is at or
+    /// before that station's watermark.
     pub fn close_ready(&mut self) -> Vec<Stats> {
-        match self.watermark() {
-            // A window [s, s + w) is complete when s + w <= watermark.
-            Some(wm) => {
-                self.close_starting_before(wm.saturating_sub(self.window_ms).saturating_add(1))
-            }
-            None => Vec::new(),
-        }
-    }
-
-    /// Closes every open window (used on shutdown or when the input goes idle).
-    pub fn close_all(&mut self) -> Vec<Stats> {
-        match self.open.keys().next_back() {
-            Some(&last) => self.close_starting_before(last + 1),
-            None => Vec::new(),
-        }
-    }
-
-    fn close_starting_before(&mut self, bound: i64) -> Vec<Stats> {
-        let still_open = self.open.split_off(&bound);
-        let ready = std::mem::replace(&mut self.open, still_open);
-        self.closed_before = self.closed_before.max(bound);
-
+        let (w, lateness) = (self.window_ms, self.allowed_lateness_ms);
         let mut out = Vec::new();
-        for (start, window) in ready {
-            for ((station, sensor), acc) in window.sensors {
-                let regime = window.regimes.get(&station).and_then(majority);
-                out.push(Stats {
-                    station,
-                    sensor,
-                    timestamp: start,
-                    window_ms: self.window_ms,
-                    mean: acc.sum / acc.count as f64,
-                    min: acc.min,
-                    max: acc.max,
-                    count: acc.count,
-                    regime,
-                });
+        for (station, state) in &mut self.stations {
+            if let Some(max_ts) = state.max_event_ts {
+                // A window [s, s + w) is complete when s + w <= watermark.
+                let bound = max_ts
+                    .saturating_sub(lateness)
+                    .saturating_sub(w)
+                    .saturating_add(1);
+                close_before(station, state, bound, w, &mut out);
             }
         }
         out
+    }
+
+    /// Closes every open window of stations whose newest event is more than
+    /// `idle_ms` older than `now_ms`, so a station that stops publishing does
+    /// not hold its last window forever.
+    pub fn close_idle(&mut self, now_ms: i64, idle_ms: i64) -> Vec<Stats> {
+        let w = self.window_ms;
+        let mut out = Vec::new();
+        for (station, state) in &mut self.stations {
+            let idle = state.max_event_ts.is_some_and(|ts| now_ms - ts > idle_ms);
+            if let (true, Some(&last)) = (idle, state.open.keys().next_back()) {
+                close_before(station, state, last + 1, w, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Closes every open window (used on shutdown).
+    pub fn close_all(&mut self) -> Vec<Stats> {
+        let w = self.window_ms;
+        let mut out = Vec::new();
+        for (station, state) in &mut self.stations {
+            if let Some(&last) = state.open.keys().next_back() {
+                close_before(station, state, last + 1, w, &mut out);
+            }
+        }
+        out
+    }
+}
+
+fn close_before(
+    station: &str,
+    state: &mut StationState,
+    bound: i64,
+    window_ms: i64,
+    out: &mut Vec<Stats>,
+) {
+    let still_open = state.open.split_off(&bound);
+    let ready = std::mem::replace(&mut state.open, still_open);
+    state.closed_before = Some(state.closed_before.map_or(bound, |b| b.max(bound)));
+
+    for (start, window) in ready {
+        let regime = majority(&window.regimes);
+        for (sensor, acc) in window.sensors {
+            out.push(Stats {
+                station: station.to_string(),
+                sensor,
+                timestamp: start,
+                window_ms,
+                mean: acc.sum / acc.count as f64,
+                min: acc.min,
+                max: acc.max,
+                count: acc.count,
+                regime,
+            });
+        }
     }
 }
 
@@ -225,6 +263,44 @@ mod tests {
         let out = agg.close_ready();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].timestamp, 1_000);
+        assert_eq!(agg.open_windows(), 1);
+    }
+
+    #[test]
+    fn zero_lateness_emits_on_the_first_event_of_the_next_window() {
+        let mut agg = WindowAggregator::new(500, 0);
+        agg.ingest(&ev("A", 1_400, vec![1.0], None));
+        assert!(agg.close_ready().is_empty());
+        agg.ingest(&ev("A", 1_500, vec![1.0], None));
+        assert_eq!(agg.close_ready().len(), 1);
+    }
+
+    #[test]
+    fn stations_close_independently() {
+        // A lagging station must not hold back the others' windows.
+        let mut agg = WindowAggregator::new(500, 0);
+        agg.ingest(&ev("A", 1_000, vec![1.0], None));
+        agg.ingest(&ev("B", 1_000, vec![2.0], None));
+        agg.ingest(&ev("A", 1_500, vec![1.0], None));
+        let out = agg.close_ready();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].station.as_str(), out[0].timestamp), ("A", 1_000));
+        // B's window is still open and B's next sample is not late.
+        assert!(matches!(
+            agg.ingest(&ev("B", 1_200, vec![2.0], None)),
+            Ingest::Accepted { .. }
+        ));
+        assert_eq!(agg.watermark("B"), Some(1_200));
+    }
+
+    #[test]
+    fn idle_stations_are_flushed() {
+        let mut agg = WindowAggregator::new(500, 0);
+        agg.ingest(&ev("A", 1_000, vec![1.0], None));
+        agg.ingest(&ev("B", 5_000, vec![1.0], None));
+        let out = agg.close_idle(5_100, 2_000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].station, "A");
         assert_eq!(agg.open_windows(), 1);
     }
 

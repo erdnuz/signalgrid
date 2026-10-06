@@ -8,8 +8,8 @@ from dataclasses import dataclass
 class Settings:
     nats_url: str
     archive_url: str | None = None
-    max_points: int = 120  # 60 s of 500 ms windows
-    refresh_ms: int = 1000
+    max_points: int = 1_800  # 15 min of 500 ms windows: the longest selectable range
+    refresh_ms: int = 250  # cheap: steady-state updates only append new points
     port: int = 8004
 
     @classmethod
