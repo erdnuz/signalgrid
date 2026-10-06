@@ -5,10 +5,10 @@ import os
 import signal
 from collections import defaultdict
 from threading import Lock, Thread
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dash import Dash, dcc, html
-from dash.dependencies import Input, Output
+from dash.dependencies import Input, Output, State
 from nats.aio.client import Client as NATS
 import plotly.graph_objects as go
 
@@ -34,7 +34,7 @@ logger = structlog.get_logger("frontend")
 
 data_lock = Lock()
 
-app = Dash(__name__, external_stylesheets=["/assets/minimal.css"])
+app = Dash(__name__)  # assets/ is served automatically
 
 
 @app.server.get("/health")
@@ -121,9 +121,9 @@ def apply_stats_event(evt):
         return
     with data_lock:
         entry = data_store[key]
-        entry["timestamps"].append(datetime.fromtimestamp(evt["timestamp"] / 1000))
+        entry["timestamps"].append(datetime.fromtimestamp(evt["timestamp"] / 1000, tz=timezone.utc))
         entry["actuals"].append(mean)
-        if len(entry["timestamps"]) > MAX_POINTS -3:
+        if len(entry["timestamps"]) > MAX_POINTS:
             entry["timestamps"].pop(0)
             entry["actuals"].pop(0)
 
@@ -181,24 +181,64 @@ def update_station_options(_):
 # -------------------------
 @app.callback(
     Output("sensor-dropdown", "options"),
-    Input("station-dropdown", "value")
-)
-def update_sensor_options(selected_station):
-    return get_sensor_options(selected_station)
-
-@app.callback(
     Output("sensor-dropdown", "value"),
-    Input("station-dropdown", "value")
+    Input("station-dropdown", "value"),
+    Input("interval", "n_intervals"),
+    State("sensor-dropdown", "value"),
 )
-def set_default_sensor(selected_station):
-    sensors = [option["value"] for option in get_sensor_options(selected_station)]
-    return sensors[0] if sensors else None
-# -------------------------
-# Dash graph callback
-# -------------------------
-# -------------------------
-# Graph layout inside callback
-# -------------------------
+def update_sensor_options(selected_station, _, current_sensor):
+    options = get_sensor_options(selected_station)
+    return options, choose_sensor(options, current_sensor)
+
+
+def choose_sensor(options, current_sensor):
+    """Keep the user's selection while it is still valid, else pick the first sensor."""
+    values = [option["value"] for option in options]
+    if current_sensor in values:
+        return current_sensor
+    return values[0] if values else None
+
+
+GRAPH_LAYOUT = dict(
+    autosize=True,
+    xaxis=dict(
+        title="Time (UTC)",
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.05)",
+        zeroline=False,
+        showline=True,
+        linecolor="#333",
+        tickfont=dict(size=12)
+    ),
+    yaxis=dict(
+        title="Value",
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.05)",
+        zeroline=False,
+        showline=True,
+        linecolor="#333",
+        tickfont=dict(size=12)
+    ),
+    template="plotly_dark",
+    plot_bgcolor="#23272b",
+    paper_bgcolor="#181c20",
+    font=dict(color="#FFF", family="Arial"),
+    legend=dict(
+        bgcolor="#222",
+        bordercolor="#444",
+        borderwidth=1,
+        orientation="h",
+        yanchor="bottom",
+        y=1.02,
+        xanchor="center",
+        x=0.5,
+        font=dict(size=12)
+    ),
+    hovermode="x unified",
+    margin=dict(l=40, r=40, t=60, b=40)
+)
+
+
 @app.callback(
     Output("live-graph", "figure"),
     [Input("interval", "n_intervals"),
@@ -206,10 +246,10 @@ def set_default_sensor(selected_station):
      Input("sensor-dropdown", "value")]
 )
 def update_graph(_, selected_station, selected_sensor):
-    fig = go.Figure()
+    fig = go.Figure(layout=GRAPH_LAYOUT)
 
     with data_lock:
-        snapshot = list(data_store.items())
+        snapshot = [(key, {k: list(v) for k, v in data.items()}) for key, data in data_store.items()]
 
     for (station, sensor), data in snapshot:
         if selected_station != "Any" and station != selected_station:
@@ -217,94 +257,42 @@ def update_graph(_, selected_station, selected_sensor):
         if selected_sensor is not None and sensor != selected_sensor:
             continue
 
-        
+        if data["timestamps"]:
+            fig.add_trace(go.Scatter(
+                x=data["timestamps"],
+                y=data["actuals"],
+                mode="lines+markers",
+                name=f"{station} Actual",
+                line=dict(color="#2196f3", width=2),
+                marker=dict(size=6, symbol="circle", opacity=0.8, color="#2196f3")
+            ))
 
-        for (station, sensor), data in snapshot:
-            if selected_station != "Any" and station != selected_station:
-                continue
-            if selected_sensor is not None and sensor != selected_sensor:
-                continue
-
-            # Actuals: blue
-            if data["timestamps"]:
-                fig.add_trace(go.Scatter(
-                    x=data["timestamps"],
-                    y=data["actuals"],
-                    mode="lines+markers",
-                    name=f"{station} Actual",
-                    line=dict(color="#2196f3", width=2),
-                    marker=dict(size=6, symbol="circle", opacity=0.8, color="#2196f3")
-                ))
-
-            # Forecast with confidence interval: yellow
-            if data.get("forecast_ts") and data.get("forecasts") and data.get("lower_ci") and data.get("upper_ci"):
-                # Confidence interval shading
-                fig.add_trace(go.Scatter(
-                    x=data["forecast_ts"],
-                    y=data["upper_ci"],
-                    mode="lines",
-                    line=dict(width=0),
-                    fill=None,
-                    showlegend=False
-                ))
-                fig.add_trace(go.Scatter(
-                    x=data["forecast_ts"],
-                    y=data["lower_ci"],
-                    mode="lines",
-                    line=dict(width=0),
-                    fill='tonexty',
-                    fillcolor='rgba(255,255,0,0.10)',
-                    showlegend=False
-                ))
-                # Forecast line
-                fig.add_trace(go.Scatter(
-                    x=data["forecast_ts"],
-                    y=data["forecasts"],
-                    mode="lines",
-                    line=dict(color="#FFD600", width=3, dash="dash"),
-                    name=f"{station} Forecast"
-                ))
-
-                fig.update_layout(
-                    autosize=True,
-                    xaxis=dict(
-                        title="Time",
-                        showgrid=True,
-                        gridcolor="rgba(255,255,255,0.05)",
-                        zeroline=False,
-                        showline=True,
-                        linecolor="#333",
-                        tickfont=dict(size=12)
-                    ),
-                    yaxis=dict(
-                        title="Value",
-                        showgrid=True,
-                        gridcolor="rgba(255,255,255,0.05)",
-                        zeroline=False,
-                        showline=True,
-                        linecolor="#333",
-                        tickfont=dict(size=12)
-                    ),
-                    template="plotly_dark",
-                    plot_bgcolor="#23272b",
-                    paper_bgcolor="#181c20",
-                    font=dict(color="#FFF", family="Arial"),
-                    legend=dict(
-                        bgcolor="#222",
-                        bordercolor="#444",
-                        borderwidth=1,
-                        orientation="h",
-                        yanchor="bottom",
-                        y=1.02,
-                        xanchor="center",
-                        x=0.5,
-                        font=dict(size=12)
-                    ),
-                    hovermode="x unified",
-                    margin=dict(l=40, r=40, t=60, b=40)
-                )
+        if data["forecast_ts"] and data["forecasts"] and data["lower_ci"] and data["upper_ci"]:
+            fig.add_trace(go.Scatter(
+                x=data["forecast_ts"],
+                y=data["upper_ci"],
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+            fig.add_trace(go.Scatter(
+                x=data["forecast_ts"],
+                y=data["lower_ci"],
+                mode="lines",
+                line=dict(width=0),
+                fill="tonexty",
+                fillcolor="rgba(255,255,0,0.10)",
+                name="98% CI",
+            ))
+            fig.add_trace(go.Scatter(
+                x=data["forecast_ts"],
+                y=data["forecasts"],
+                mode="lines",
+                line=dict(color="#FFD600", width=3, dash="dash"),
+                name=f"{station} Forecast"
+            ))
     return fig
-
 
 
 # -------------------------

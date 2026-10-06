@@ -1,98 +1,87 @@
+use anyhow::Context;
 use async_nats::ConnectOptions;
 use bytes::Bytes;
-use forge::{aggregate_stats, Event, Stats};
-use futures::stream::StreamExt;
-use std::sync::Arc;
-use std::env;
-use anyhow::Context;
-use tokio::sync::watch;
-use tokio::time::{self, Duration};
 use chrono::Utc;
+use forge::{aggregate_stats, prune_expired, Event};
+use futures::stream::StreamExt;
+use std::env;
+use tokio::time::{self, Duration};
+use tracing::{error, info, warn};
 
 const INITIAL_AGGREGATION_DELAY_SECS: u64 = 5;
 const AGGREGATION_INTERVAL_MS: u64 = 400;
 
-use tracing::{info, error};
-use tracing_subscriber;
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let nats_url = env::var("NATS_URL").context("NATS_URL environment variable must be set")?;
-    let client = ConnectOptions::new().connect(&nats_url).await?;
+    let client = ConnectOptions::new()
+        .retry_on_initial_connect()
+        .connect(&nats_url)
+        .await?;
     info!(service = "forge", event = "nats_connected", %nats_url);
 
-    let stats_history: Arc<tokio::sync::Mutex<Vec<Stats>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let mut sub = client.subscribe("events").await?;
-    let stats_history_clone = stats_history.clone();
-    let client_clone = client.clone();
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let mut buffer: Vec<Event> = Vec::new();
+    let start = time::Instant::now() + Duration::from_secs(INITIAL_AGGREGATION_DELAY_SECS);
+    let mut ticker = time::interval_at(start, Duration::from_millis(AGGREGATION_INTERVAL_MS));
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
-    let aggregation_task = tokio::spawn(async move {
-        let mut buffer: Vec<Event> = Vec::new();
-        let mut sleep = Box::pin(time::sleep(Duration::from_secs(INITIAL_AGGREGATION_DELAY_SECS)));
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!(service = "forge", event = "signal_received");
+                break;
+            }
 
-        loop {
-            tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    if changed.is_ok() && *shutdown_rx.borrow() {
-                        info!(service = "forge", event = "stopping_aggregation");
-                        break;
-                    }
+            maybe_msg = sub.next() => {
+                let Some(msg) = maybe_msg else {
+                    warn!(service = "forge", event = "subscription_closed");
+                    break;
+                };
+                match serde_json::from_slice::<Event>(&msg.payload) {
+                    Ok(event) => buffer.push(event),
+                    Err(e) => error!(service = "forge", event = "parse_event_failed", error = %e),
                 }
+            }
 
-                maybe_msg = sub.next() => {
-                    if let Some(msg) = maybe_msg {
-                        if let Ok(event) = serde_json::from_slice::<Event>(&msg.payload) {
-                            buffer.push(event);
-                        } else {
-                            error!(service = "forge", event = "parse_event_failed");
-                        }
-                    }
-                }
-
-                _ = &mut sleep => {
-                    if !buffer.is_empty() {
-                        let now_ms = Utc::now().timestamp_millis() as u64;
-                        let stats_to_publish = aggregate_stats(&buffer, now_ms);
-
-                        // Store history
-                        {
-                            let mut guard = stats_history_clone.lock().await;
-                            guard.extend(stats_to_publish.clone());
-                        }
-
-                        // Publish stats
-                        for stat in stats_to_publish {
-                            match serde_json::to_vec(&stat) {
-                                Ok(encoded) => {
-                                    let payload: Bytes = encoded.into();
-                                    if let Err(e) = client_clone.publish("stats", payload).await {
-                                        error!(service = "forge", event = "publish_stats_failed", error = %e);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(service = "forge", event = "encode_stats_failed", error = %e);
-                                }
+            _ = ticker.tick() => {
+                let now_ms = Utc::now().timestamp_millis() as u64;
+                prune_expired(&mut buffer, now_ms);
+                for stat in aggregate_stats(&buffer, now_ms) {
+                    match serde_json::to_vec(&stat) {
+                        Ok(encoded) => {
+                            let payload: Bytes = encoded.into();
+                            if let Err(e) = client.publish("stats", payload).await {
+                                error!(service = "forge", event = "publish_stats_failed", error = %e);
                             }
                         }
+                        Err(e) => error!(service = "forge", event = "encode_stats_failed", error = %e),
                     }
-
-                    // Reset sleep
-                    sleep = Box::pin(time::sleep(Duration::from_millis(AGGREGATION_INTERVAL_MS)));
                 }
             }
         }
-    });
-
-    tokio::signal::ctrl_c().await?;
-    info!(service = "forge", event = "signal_received", signal = "ctrl_c");
-    let _ = shutdown_tx.send(true);
-
-    if let Err(e) = aggregation_task.await {
-        error!(service = "forge", event = "task_join_error", error = %e);
     }
 
+    client.flush().await?;
     Ok(())
 }

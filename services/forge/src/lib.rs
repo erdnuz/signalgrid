@@ -21,6 +21,12 @@ pub struct Stats {
     pub timestamp: u64,
 }
 
+/// Drops buffered events that can no longer fall inside any future aggregation window.
+pub fn prune_expired(events: &mut Vec<Event>, now_ms: u64) {
+    let cutoff_ms = now_ms.saturating_sub(AGGREGATION_WINDOW_MS);
+    events.retain(|event| event.timestamp > cutoff_ms);
+}
+
 pub fn aggregate_stats(events: &[Event], now_ms: u64) -> Vec<Stats> {
     let cutoff_ms = now_ms.saturating_sub(AGGREGATION_WINDOW_MS);
 
@@ -38,10 +44,7 @@ pub fn aggregate_stats(events: &[Event], now_ms: u64) -> Vec<Stats> {
         let clean_values: Vec<f64> = values.into_iter().filter(|value| value.is_finite()).collect();
 
         if clean_values.is_empty() {
-            eprintln!(
-                "Skipping stats aggregation for {}:{} due to empty/non-finite values",
-                station, sensor
-            );
+            tracing::warn!(%station, sensor, "skipping stats aggregation: no finite values");
             continue;
         }
 
@@ -119,6 +122,15 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].count, 1);
         assert!((out[0].mean - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prune_expired_bounds_buffer_to_window() {
+        let now = 10_000;
+        let mut events: Vec<Event> = (0..100).map(|i| mk_event("A", now - 1_000 + i * 10, vec![1.0])).collect();
+        prune_expired(&mut events, now);
+        assert!(events.iter().all(|e| e.timestamp > now - AGGREGATION_WINDOW_MS));
+        assert_eq!(events.len(), (AGGREGATION_WINDOW_MS / 10 - 1) as usize);
     }
 
     #[test]

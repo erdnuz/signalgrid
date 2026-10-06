@@ -14,7 +14,7 @@ The application consists of several services communicating via **NATS**:
 - **Forge (Rust)**: Subscribes to the data, computes statistics (mean, min, max), and republishes results to NATS.  
 - **Archive (Rust)**: Subscribes to stats and archives them in a PostgreSQL database. Provides an API to query historical data by station, sensor, and time range.  
 - **Forecast (Python)**: Subscribes to data and stats, produces forecasts with confidence intervals, and publishes forecast results.  
-- **Frontend (Python / Dash)**: Dash-based web dashboard to visualize live and forecasted sensor data. Users can select stations and--
+- **Frontend (Python / Dash)**: Dash-based web dashboard to visualize live and forecasted sensor data. Users pick a station and sensor to see live means alongside 3-step forecasts with 98% confidence intervals.
 
 ---
 
@@ -52,7 +52,8 @@ cd signalgrid
 ### Start the services
 
 ```bash
-docker-compose up --build
+cp .env.example .env   # local dev credentials
+docker compose up --build
 ```
 
 This will:

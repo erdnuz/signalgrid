@@ -72,3 +72,33 @@ def test_apply_forecast_event_handles_short_existing_buffer():
     entry = frontend_main.data_store[key]
     assert len(entry["forecast_ts"]) == 3
     assert entry["forecasts"] == [2.0, 2.1, 2.2]
+
+
+def _add_series(station, sensor, n=5):
+    for idx in range(n):
+        frontend_main.apply_stats_event(
+            {"station": station, "sensor": sensor, "timestamp": 1700000000000 + idx, "mean": float(idx)}
+        )
+
+
+def test_update_graph_adds_one_actual_trace_per_matching_series():
+    # Regression: a duplicated nested loop used to add N^2 traces.
+    _add_series("StationA", 0)
+    _add_series("StationB", 0)
+    fig = frontend_main.update_graph(0, "Any", 0)
+    actual_traces = [t for t in fig.data if t.name and t.name.endswith("Actual")]
+    assert len(actual_traces) == 2
+
+
+def test_update_graph_applies_dark_layout_without_forecasts():
+    # Regression: layout was only applied once a forecast existed.
+    _add_series("StationA", 0)
+    fig = frontend_main.update_graph(0, "Any", 0)
+    assert fig.layout.paper_bgcolor == "#181c20"
+
+
+def test_choose_sensor_keeps_valid_selection_and_falls_back():
+    options = [{"label": 0, "value": 0}, {"label": 1, "value": 1}]
+    assert frontend_main.choose_sensor(options, 1) == 1
+    assert frontend_main.choose_sensor(options, 7) == 0
+    assert frontend_main.choose_sensor([], None) is None

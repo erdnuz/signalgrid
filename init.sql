@@ -1,5 +1,3 @@
-DROP TABLE IF EXISTS stats;
-
 CREATE TABLE IF NOT EXISTS stats (
     id TEXT PRIMARY KEY,
     station TEXT NOT NULL,

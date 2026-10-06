@@ -20,7 +20,7 @@ SignalGrid is a modular, containerized platform for ingesting, processing, forec
 ### 2. **forecast**
 
 - **Language:** Python
-- **Role:** Performs time-series forecasting on incoming sensor data. Listens for new data events, applies statistical or ML models, and publishes forecast results (with confidence intervals) back to the pipeline.
+- **Role:** Fits an AR(1) / discrete Ornstein-Uhlenbeck model per sensor to the rolling window of stats and publishes 3-step forecasts with 98% prediction intervals (innovation variance + delta-method parameter uncertainty).
 - **Key Features:**
   - Receives raw/processed sensor data
   - Runs forecasting models
@@ -31,9 +31,9 @@ SignalGrid is a modular, containerized platform for ingesting, processing, forec
 - **Language:** Rust
 - **Role:** Responsible for long-term storage and retrieval of sensor data. Listens for data events and persists them efficiently. Supports querying historical data for analysis or reprocessing.
 - **Key Features:**
-  - High-performance data ingestion
-  - Efficient storage (e.g., using columnar or compressed formats)
-  - Query API for historical data
+  - Buffered, batched ingestion into PostgreSQL
+  - Final flush on shutdown so buffered rows are not lost
+  - `GET /stats` query API (filters + bounded `limit`) on port 8003
 
 ### 4. **pulse**
 
@@ -70,11 +70,11 @@ SignalGrid is a modular, containerized platform for ingesting, processing, forec
 
 ```mermaid
 graph TD
-    Pulse[Pulse (Rust): Data Ingest/Sim]
-    Forge[Forge (Rust): Aggregation/Transform]
-    Archive[Archive (Rust): Storage]
-    Forecast[Forecast (Python): Forecasting]
-    Frontend[Frontend (Python): Dashboard]
+    Pulse["Pulse (Rust): Data Ingest/Sim"]
+    Forge["Forge (Rust): Aggregation/Transform"]
+    Archive["Archive (Rust): Storage"]
+    Forecast["Forecast (Python): Forecasting"]
+    Frontend["Frontend (Python): Dashboard"]
     NATS[NATS Message Bus]
 
     Pulse -- Raw Events --> NATS

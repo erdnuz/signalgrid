@@ -1,30 +1,39 @@
+//! Regime-switching multivariate Ornstein-Uhlenbeck sensor simulator.
+//!
+//! Each step applies an Euler-discretised OU update per channel with
+//! cross-channel correlated Gaussian shocks, then samples the next regime
+//! from a Markov transition matrix.
+
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
-use rand::Rng;
 
-// Named constants to avoid magic numbers and improve readability
-const DEFAULT_N_REGIMES: usize = 3;
-const DEFAULT_N_CHANNELS: usize = 4;
-const DEFAULT_CORR_RANGE: f64 = 0.3;
+pub const N_REGIMES: usize = 3;
+pub const N_CHANNELS: usize = 4;
+const CORR_RANGE: f64 = 0.3;
 
-const DEFAULT_OU_THETA: [[f64; DEFAULT_N_CHANNELS]; DEFAULT_N_REGIMES] = [
-    [0.01, 0.01, 0.01, 0.01], // R0
-    [0.02, 0.02, 0.02, 0.02], // R1
-    [0.015, 0.015, 0.015, 0.015], // R2
+type ChannelParams = [[f64; N_CHANNELS]; N_REGIMES];
+type Matrix = [[f64; N_CHANNELS]; N_CHANNELS];
+
+const OU_THETA: ChannelParams = [
+    [0.01, 0.01, 0.01, 0.01],
+    [0.02, 0.02, 0.02, 0.02],
+    [0.015, 0.015, 0.015, 0.015],
 ];
 
-const DEFAULT_OU_MU: [[f64; DEFAULT_N_CHANNELS]; DEFAULT_N_REGIMES] = [
+const OU_MU: ChannelParams = [
     [0.0, 0.0, 0.0, 0.0],
     [1.0, 2.0, 1.0, 2.0],
     [-2.0, -2.0, -1.0, -1.0],
 ];
 
-const DEFAULT_OU_SIGMA: [[f64; DEFAULT_N_CHANNELS]; DEFAULT_N_REGIMES] = [
+const OU_SIGMA: ChannelParams = [
     [0.2, 0.2, 0.2, 0.2],
     [0.15, 0.15, 0.15, 0.15],
     [0.25, 0.25, 0.25, 0.25],
 ];
 
-const DEFAULT_TRANSITION_MATRIX: [[f64; DEFAULT_N_REGIMES]; DEFAULT_N_REGIMES] = [
+pub const TRANSITION_MATRIX: [[f64; N_REGIMES]; N_REGIMES] = [
     [0.995, 0.002, 0.003],
     [0.004, 0.992, 0.004],
     [0.005, 0.0025, 0.9925],
@@ -33,104 +42,117 @@ const DEFAULT_TRANSITION_MATRIX: [[f64; DEFAULT_N_REGIMES]; DEFAULT_N_REGIMES] =
 pub struct IoTSensorSimulator {
     pub n_channels: usize,
     pub regime_idx: usize,
-    ou_theta: Vec<Vec<f64>>,   // [regime][channel]
-    ou_mu: Vec<Vec<f64>>,
-    ou_sigma: Vec<Vec<f64>>,
-    corr_matrix: Vec<Vec<Vec<f64>>>, // [regime][i][j]
-    transition_matrix: Vec<Vec<f64>>, // [regime_from][regime_to]
-    state: Vec<f64>,
+    /// Target correlation matrix per regime.
+    corr: [Matrix; N_REGIMES],
+    /// Lower-triangular Cholesky factor of `corr`, used to mix i.i.d. shocks.
+    chol: [Matrix; N_REGIMES],
+    state: [f64; N_CHANNELS],
+    rng: StdRng,
+}
+
+impl Default for IoTSensorSimulator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IoTSensorSimulator {
     pub fn new() -> Self {
-        let n_regimes = DEFAULT_N_REGIMES;
-        let n_channels = DEFAULT_N_CHANNELS;
-        let mut rng = rand::rng();
+        Self::with_rng(StdRng::from_os_rng())
+    }
 
-        // OU parameters per regime (main + transition)
-        let ou_theta: Vec<Vec<f64>> = DEFAULT_OU_THETA.iter().map(|r| r.to_vec()).collect();
-        let ou_mu: Vec<Vec<f64>> = DEFAULT_OU_MU.iter().map(|r| r.to_vec()).collect();
-        let ou_sigma: Vec<Vec<f64>> = DEFAULT_OU_SIGMA.iter().map(|r| r.to_vec()).collect();
+    pub fn with_seed(seed: u64) -> Self {
+        Self::with_rng(StdRng::seed_from_u64(seed))
+    }
 
-        // Correlation matrices
-        let mut corr_matrix = vec![vec![vec![0.0; n_channels]; n_channels]; n_regimes];
-        for r in 0..n_regimes {
-            for i in 0..n_channels {
-                corr_matrix[r][i][i] = 1.0; // diagonal
-                for j in (i+1)..n_channels {
-                    let value = rng.random_range(-DEFAULT_CORR_RANGE..DEFAULT_CORR_RANGE);
-                    corr_matrix[r][i][j] = value;
-                    corr_matrix[r][j][i] = value; // mirror
+    fn with_rng(mut rng: StdRng) -> Self {
+        let mut corr = [[[0.0; N_CHANNELS]; N_CHANNELS]; N_REGIMES];
+        let mut chol = corr;
+        for r in 0..N_REGIMES {
+            // Resample until positive definite. With |rho| < 0.3 and 4 channels
+            // this almost always succeeds on the first draw.
+            loop {
+                let candidate = random_correlation(&mut rng);
+                if let Some(l) = cholesky(&candidate) {
+                    corr[r] = candidate;
+                    chol[r] = l;
+                    break;
                 }
             }
         }
 
-        // Transition matrix
-        let mut transition_matrix = vec![vec![0.0; n_regimes]; n_regimes];
-        for r in 0..n_regimes {
-            transition_matrix[r] = DEFAULT_TRANSITION_MATRIX[r].to_vec();
-        }
-
-        let state = ou_mu[0].clone();
-
         Self {
-            n_channels,
+            n_channels: N_CHANNELS,
             regime_idx: 0,
-            ou_theta,
-            ou_mu,
-            ou_sigma,
-            corr_matrix,
-            transition_matrix,
-            state,
+            corr,
+            chol,
+            state: OU_MU[0],
+            rng,
         }
     }
 
+    pub fn correlation(&self, regime: usize) -> &Matrix {
+        &self.corr[regime]
+    }
 
     pub fn step(&mut self) -> Vec<f64> {
-        let mut rng = rand::rng();
+        let r = self.regime_idx;
 
-        // --- Generate correlated noise using StandardNormal (no fallible constructor) ---
-        let mut noise = vec![0.0; self.n_channels];
-        for i in 0..self.n_channels {
-            noise[i] = rng.sample(StandardNormal);
+        let z: [f64; N_CHANNELS] = std::array::from_fn(|_| self.rng.sample(StandardNormal));
+        let l = &self.chol[r];
+        for i in 0..N_CHANNELS {
+            let shock: f64 = (0..=i).map(|j| l[i][j] * z[j]).sum();
+            self.state[i] += OU_THETA[r][i] * (OU_MU[r][i] - self.state[i]) + OU_SIGMA[r][i] * shock;
         }
 
-        let mut correlated_noise = vec![0.0; self.n_channels];
-        for i in 0..self.n_channels {
-            correlated_noise[i] = 0.0;
-            for j in 0..self.n_channels {
-                correlated_noise[i] += self.corr_matrix[self.regime_idx][i][j] * noise[j];
-            }
-        }
-
-        // --- OU update per channel ---
-        for i in 0..self.n_channels {
-            self.state[i] += self.ou_theta[self.regime_idx][i] * (self.ou_mu[self.regime_idx][i] - self.state[i])
-                            + self.ou_sigma[self.regime_idx][i] * correlated_noise[i];
-        }
-
-
-        let probs = self.transition_matrix[self.regime_idx].clone();
-        
-
-        // Sample next regime
-        let r: f64 = rng.random();
+        let u: f64 = self.rng.random();
         let mut cumulative = 0.0;
-        for (i, &p) in probs.iter().enumerate() {
+        for (next, &p) in TRANSITION_MATRIX[r].iter().enumerate() {
             cumulative += p;
-            if r < cumulative {
-                if self.regime_idx != i {
-                    println!("Changing regime from {} to {}", self.regime_idx, i);
+            if u < cumulative {
+                if next != r {
+                    tracing::info!(service = "pulse", event = "regime_change", from = r, to = next);
                 }
-                
-                self.regime_idx = i;
+                self.regime_idx = next;
                 break;
             }
         }
 
-        self.state.clone()
+        self.state.to_vec()
     }
+}
 
+fn random_correlation(rng: &mut StdRng) -> Matrix {
+    let mut m = [[0.0; N_CHANNELS]; N_CHANNELS];
+    for i in 0..N_CHANNELS {
+        m[i][i] = 1.0;
+        for j in (i + 1)..N_CHANNELS {
+            let v = rng.random_range(-CORR_RANGE..CORR_RANGE);
+            m[i][j] = v;
+            m[j][i] = v;
+        }
+    }
+    m
+}
+
+/// Cholesky decomposition `a = l * l^T`; `None` if `a` is not positive definite.
+pub fn cholesky(a: &Matrix) -> Option<Matrix> {
+    let mut l = [[0.0; N_CHANNELS]; N_CHANNELS];
+    for i in 0..N_CHANNELS {
+        for j in 0..=i {
+            let sum: f64 = (0..j).map(|k| l[i][k] * l[j][k]).sum();
+            if i == j {
+                let d = a[i][i] - sum;
+                if d <= 0.0 {
+                    return None;
+                }
+                l[i][j] = d.sqrt();
+            } else {
+                l[i][j] = (a[i][j] - sum) / l[j][j];
+            }
+        }
+    }
+    Some(l)
 }
 
 #[cfg(test)]
@@ -139,25 +161,69 @@ mod tests {
 
     #[test]
     fn simulator_initializes_expected_shape() {
-        let simulator = IoTSensorSimulator::new();
-        assert_eq!(simulator.n_channels, 4);
+        let simulator = IoTSensorSimulator::with_seed(1);
+        assert_eq!(simulator.n_channels, N_CHANNELS);
         assert_eq!(simulator.regime_idx, 0);
-        assert_eq!(simulator.state.len(), simulator.n_channels);
-    }
-
-    #[test]
-    fn step_returns_one_value_per_channel() {
-        let mut simulator = IoTSensorSimulator::new();
-        let sample = simulator.step();
-        assert_eq!(sample.len(), simulator.n_channels);
     }
 
     #[test]
     fn step_keeps_regime_in_valid_range() {
-        let mut simulator = IoTSensorSimulator::new();
-        for _ in 0..200 {
-            let _ = simulator.step();
-            assert!(simulator.regime_idx < 3);
+        let mut simulator = IoTSensorSimulator::with_seed(2);
+        for _ in 0..1_000 {
+            let sample = simulator.step();
+            assert_eq!(sample.len(), N_CHANNELS);
+            assert!(sample.iter().all(|v| v.is_finite()));
+            assert!(simulator.regime_idx < N_REGIMES);
+        }
+    }
+
+    #[test]
+    fn cholesky_reconstructs_input() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let a = random_correlation(&mut rng);
+        let l = cholesky(&a).expect("positive definite");
+        for i in 0..N_CHANNELS {
+            for j in 0..N_CHANNELS {
+                let v: f64 = (0..N_CHANNELS).map(|k| l[i][k] * l[j][k]).sum();
+                assert!((v - a[i][j]).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn cholesky_rejects_non_positive_definite() {
+        let mut a = [[0.0; N_CHANNELS]; N_CHANNELS];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        a[0][1] = 1.5;
+        a[1][0] = 1.5;
+        assert!(cholesky(&a).is_none());
+    }
+
+    /// The mixed shocks must reproduce the target correlation (the original
+    /// implementation produced C*C^T instead of C).
+    #[test]
+    fn shocks_have_target_correlation() {
+        let mut sim = IoTSensorSimulator::with_seed(4);
+        let l = sim.chol[0];
+        let target = sim.corr[0];
+        let n = 200_000;
+        let mut acc = [[0.0; N_CHANNELS]; N_CHANNELS];
+        for _ in 0..n {
+            let z: [f64; N_CHANNELS] = std::array::from_fn(|_| sim.rng.sample(StandardNormal));
+            let x: [f64; N_CHANNELS] = std::array::from_fn(|i| (0..=i).map(|j| l[i][j] * z[j]).sum());
+            for i in 0..N_CHANNELS {
+                for j in 0..N_CHANNELS {
+                    acc[i][j] += x[i] * x[j];
+                }
+            }
+        }
+        for i in 0..N_CHANNELS {
+            for j in 0..N_CHANNELS {
+                let emp = acc[i][j] / n as f64;
+                assert!((emp - target[i][j]).abs() < 0.02, "({i},{j}) {emp} vs {}", target[i][j]);
+            }
         }
     }
 }

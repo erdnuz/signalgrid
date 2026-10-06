@@ -10,11 +10,11 @@ from scipy.stats import t
 from nats.aio.client import Client as NATS
 import numpy as np
 
-NATS_URL = os.environ["NATS_URL"]  # Required, fail if missing
 FORECAST_HORIZON = 3
 TIME_DELTA_SEC = 0.4
 MAX_POINTS = 50
 MIN_POINTS = 20
+CI_ALPHA = 0.02  # two-sided -> 98% interval
 INITIAL_RETRY_BACKOFF_SEC = 1
 MAX_RETRY_BACKOFF_SEC = 30
 
@@ -58,61 +58,55 @@ def ensure_forecast_task(nc, key, stop_event):
             forecast_loop(nc, key, stop_event)
         )
 
-def forecast_ou(values, n_steps=3, alpha=0.02):
+def forecast_ou(values, n_steps=3, alpha=CI_ALPHA):
+    """Fit a discrete OU / AR(1) model x_{t+1} = c + phi * x_t + eps by OLS and
+    return h-step forecasts with (1 - alpha) prediction intervals.
+
+    Interval variance = innovation variance accumulated over h steps
+    + parameter uncertainty propagated by the delta method:
+        d xhat_h / d phi = h * phi^(h-1) * (x_T - mu)
+        d xhat_h / d mu  = 1 - phi^h
+    (the phi/mu covariance is ignored).
+    """
     if len(values) < MIN_POINTS:
         return None, None
 
-    x = np.array(values)
-    x_t = x[:-1]
-    x_tp1 = x[1:]
+    x = np.asarray(values, dtype=float)
+    x_t, x_tp1 = x[:-1], x[1:]
+    n = len(x_t)
 
-    if np.std(x_t) == 0 or np.sum((x_t - np.mean(x_t)) ** 2) == 0:
+    sxx = np.sum((x_t - x_t.mean()) ** 2)
+    if sxx == 0:
         return None, None
 
-    # Fit discrete OU (AR1)
-    phi = np.corrcoef(x_t, x_tp1)[0, 1] * np.std(x_tp1) / np.std(x_t)
-
-    if np.isnan(phi) or np.isinf(phi):
+    phi = np.sum((x_t - x_t.mean()) * (x_tp1 - x_tp1.mean())) / sxx
+    if not np.isfinite(phi) or np.isclose(phi, 1.0) or np.isclose(phi ** 2, 1.0):
         return None, None
 
-    mu = np.mean(x_tp1 - phi * x_t) / (1 - phi)
-    sigma_eps = np.sqrt(np.mean((x_tp1 - (phi * x_t + (1 - phi) * mu)) ** 2))
-
-    if np.isnan(sigma_eps) or np.isinf(sigma_eps):
+    c = x_tp1.mean() - phi * x_t.mean()
+    mu = c / (1 - phi)
+    resid = x_tp1 - (c + phi * x_t)
+    sigma2 = np.sum(resid ** 2) / (n - 2)
+    if not np.isfinite(sigma2):
         return None, None
+
+    se_phi = np.sqrt(sigma2 / sxx)
+    se_mu = np.sqrt(sigma2 / n) / abs(1 - phi)
+    t_val = t.ppf(1 - alpha / 2, df=n - 2)
 
     last_val = x[-1]
-    forecasts = []
-    ci_list = []
-
-    n = len(values)
-    t_val = t.ppf(1 - alpha / 2, df=n - 2)  # df = n-2 for slope/intercept
-
-    if np.isnan(t_val) or np.isinf(t_val):
-        return None, None
-
+    forecasts, ci_list = [], []
     for h in range(1, n_steps + 1):
-        next_val = mu + phi ** h * (last_val - mu)
-        forecasts.append(next_val)
-        denom = np.sum((x_t - np.mean(x_t)) ** 2)
-        if denom == 0:
+        point = mu + phi ** h * (last_val - mu)
+        innovation_var = sigma2 * (1 - phi ** (2 * h)) / (1 - phi ** 2)
+        param_var = (h * phi ** (h - 1) * (last_val - mu) * se_phi) ** 2 + ((1 - phi ** h) * se_mu) ** 2
+        var_h = innovation_var + param_var
+        if not np.isfinite(var_h) or var_h < 0:
             return None, None
 
-        se_phi = sigma_eps / np.sqrt(denom)
-        se_mu = sigma_eps * np.sqrt(1 / len(x_t) + np.mean(x_t) ** 2 / denom)
-
-        if np.isclose(1 - phi ** 2, 0.0):
-            return None, None
-
-        var_h = sigma_eps ** 2 * (1 - phi ** (2 * h)) / (1 - phi ** 2)
-        var_h += (h * se_phi)**2 + se_mu**2  # approximate accumulation of parameter uncertainty
-
-        if var_h < 0 or np.isnan(var_h) or np.isinf(var_h):
-            return None, None
-
-        lower = next_val - t_val * np.sqrt(var_h)
-        upper = next_val + t_val * np.sqrt(var_h)
-        ci_list.append((lower, upper))
+        half_width = t_val * np.sqrt(var_h)
+        forecasts.append(float(point))
+        ci_list.append((float(point - half_width), float(point + half_width)))
 
     return forecasts, ci_list
 
@@ -159,15 +153,15 @@ async def stop_forecast_tasks():
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def process_stats_and_forecast(stop_event: asyncio.Event):
+async def process_stats_and_forecast(nats_url: str, stop_event: asyncio.Event):
     backoff_sec = INITIAL_RETRY_BACKOFF_SEC
 
     while not stop_event.is_set():
         nc = NATS()
 
         try:
-            await nc.connect(servers=[NATS_URL])
-            logger.info("service=forecast event=nats_connected nats_url=%s", NATS_URL)
+            await nc.connect(servers=[nats_url])
+            logger.info("service=forecast event=nats_connected nats_url=%s", nats_url)
             backoff_sec = INITIAL_RETRY_BACKOFF_SEC
 
             async def handle_stats(msg):
@@ -213,7 +207,8 @@ async def main():
         except NotImplementedError:
             pass
 
-    await process_stats_and_forecast(stop_event)
+    nats_url = os.environ["NATS_URL"]  # required; fail fast if missing
+    await process_stats_and_forecast(nats_url, stop_event)
 
 
 if __name__ == "__main__":
