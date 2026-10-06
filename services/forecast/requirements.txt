@@ -1,5 +1,5 @@
-nats-py
-numpy
-scipy
-pytest
-pytest-asyncio
+nats-py==2.16.0
+numpy==2.5.3
+scipy==1.18.1
+pydantic==2.13.5
+prometheus-client==0.26.0

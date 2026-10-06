@@ -1,0 +1,12 @@
+{
+  "station": "StationA",
+  "sensor": 2,
+  "origin_ts": 1700000000000,
+  "step_ms": 500,
+  "timestamps": [1700000000500, 1700000001000, 1700000001500],
+  "forecasts": [1.5, 1.45, 1.41],
+  "lower_ci": [1.1, 0.95, 0.83],
+  "upper_ci": [1.9, 1.95, 1.99],
+  "confidence": 0.98,
+  "metrics": {"n": 120, "mae": 0.08, "coverage": 0.975}
+}

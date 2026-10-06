@@ -1,0 +1,136 @@
+/* SignalGrid dashboard. Surface and ink tokens match the chart palette in figures.py. */
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-raised: #222220;
+  --ink: #ffffff;
+  --ink-secondary: #c3c2b7;
+  --ink-muted: #898781;
+  --hairline: rgba(255, 255, 255, 0.10);
+  --focus: #3987e5;
+  --radius: 12px;
+  --gap: 16px;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+html, body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 16px;
+  min-height: 100vh;
+}
+
+.container {
+  box-sizing: border-box;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 32px var(--gap) 48px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+.title {
+  margin: 0;
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin: 4px 0 0;
+  color: var(--ink-secondary);
+  font-size: 0.95rem;
+}
+
+/* ---- controls ---- */
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+}
+
+.control {
+  flex: 1 1 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.label {
+  color: var(--ink-muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Dash dropdown (react-select) on the dark surface */
+.control .Select-control,
+.control .dash-dropdown {
+  background: var(--surface) !important;
+  border: 1px solid var(--hairline) !important;
+  border-radius: 8px !important;
+  color: var(--ink) !important;
+}
+.control .Select-value-label,
+.control .Select-placeholder,
+.control .Select-input > input { color: var(--ink) !important; }
+.control .Select-menu-outer {
+  background: var(--surface-raised) !important;
+  border: 1px solid var(--hairline) !important;
+}
+.control .VirtualizedSelectOption,
+.control .Select-option { background: var(--surface-raised) !important; color: var(--ink-secondary) !important; }
+.control .VirtualizedSelectFocusedOption,
+.control .Select-option.is-focused { background: #2c2c2a !important; color: var(--ink) !important; }
+.control .is-focused:not(.is-open) > .Select-control { border-color: var(--focus) !important; }
+
+/* ---- KPI tiles ---- */
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.kpi {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.kpi-label {
+  color: var(--ink-secondary);
+  font-size: 0.85rem;
+}
+
+.kpi-value {
+  margin-top: 6px;
+  font-size: 1.6rem;
+  font-weight: 650;
+}
+
+.kpi-note {
+  margin-top: 2px;
+  color: var(--ink-muted);
+  font-size: 0.75rem;
+}
+
+/* ---- chart ---- */
+.chart {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  overflow: hidden;
+  height: 620px;
+}
+
+@media (max-width: 640px) {
+  .container { padding-top: 20px; }
+  .title { font-size: 1.4rem; }
+  .chart { height: 480px; }
+  .kpi-value { font-size: 1.35rem; }
+}

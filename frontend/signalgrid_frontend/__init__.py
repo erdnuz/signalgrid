@@ -1,0 +1,1 @@
+"""SignalGrid live dashboard."""

@@ -1,0 +1,10 @@
+{
+  "station": "StationA",
+  "timestamp": 1700000000100,
+  "probabilities": [0.02, 0.95, 0.03],
+  "state": 1,
+  "true_regime": 0,
+  "mapped_state": 0,
+  "accuracy": 0.91,
+  "n_scored": 3000
+}
