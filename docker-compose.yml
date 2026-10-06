@@ -1,81 +1,97 @@
+name: signalgrid
+
+x-rust-service: &rust-service
+  restart: unless-stopped
+  stop_grace_period: 15s
+  environment: &rust-env
+    NATS_URL: ${NATS_URL}
+    LOG_FORMAT: json
+    RUST_LOG: info
+  depends_on:
+    nats:
+      condition: service_healthy
+
 services:
-  # Message Bus (NATS)
+  # Message bus with JetStream persistence for the stats stream.
   nats:
-    image: nats:latest
-    container_name: signalgrid-nats
+    image: nats:2.10-alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
     ports:
       - "127.0.0.1:4222:4222"   # client connections
-      - "127.0.0.1:8222:8222"   # monitoring UI
+      - "127.0.0.1:8222:8222"   # monitoring
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
-  # Pulse: Event Producer
+  # Pulse: regime-switching OU simulator -> sg.raw.<station>
   pulse:
+    <<: *rust-service
     build:
-      context: ./services/pulse
-      dockerfile: Dockerfile
-    container_name: signalgrid-pulse
+      context: ./services
+      args: { SERVICE: pulse }
     environment:
-      NATS_URL: ${NATS_URL}
-    depends_on:
-      - nats
-    restart: unless-stopped
+      <<: *rust-env
+      N_STATIONS: ${N_STATIONS:-2}
+      PUBLISH_INTERVAL_MS: ${PUBLISH_INTERVAL_MS:-100}
 
-  # Forge: Event Processor
+  # Forge: event-time tumbling windows -> sg.stats.<station>.<sensor> (JetStream)
   forge:
+    <<: *rust-service
     build:
-      context: ./services/forge
-      dockerfile: Dockerfile
-    container_name: signalgrid-forge
+      context: ./services
+      args: { SERVICE: forge }
     environment:
-      NATS_URL: ${NATS_URL}
-    depends_on:
-      - nats
-    restart: unless-stopped
+      <<: *rust-env
+      WINDOW_MS: ${WINDOW_MS:-500}
+      ALLOWED_LATENESS_MS: 200
 
-  # Archive: Storage + REST API
+  # Archive: durable JetStream consumer -> PostgreSQL, REST API on :8003
   archive:
+    <<: *rust-service
     build:
-      context: ./services/archive
-      dockerfile: Dockerfile
-    container_name: signalgrid-archive
+      context: ./services
+      args: { SERVICE: archive }
     environment:
-      NATS_URL: ${NATS_URL}
+      <<: *rust-env
       DATABASE_URL: ${DATABASE_URL}
     depends_on:
-      - nats
-      - postgres
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     ports:
       - "127.0.0.1:8003:8003"
-    restart: unless-stopped
 
   forecast:
     build:
       context: ./services/forecast
-      dockerfile: Dockerfile
-    container_name: signalgrid-forecast
     environment:
       NATS_URL: ${NATS_URL}
     depends_on:
-      - nats
+      nats:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile
-    container_name: signalgrid-frontend
     environment:
       NATS_URL: ${NATS_URL}
+      ARCHIVE_URL: http://archive:8003
     depends_on:
-      - nats
+      nats:
+        condition: service_healthy
     ports:
-      - "8004:8004"
+      - "127.0.0.1:8004:8004"
     restart: unless-stopped
 
-  # PostgreSQL
   postgres:
-    image: postgres:15
-    container_name: signalgrid-postgres
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -84,10 +100,13 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - type: bind
-        source: ./init.sql
-        target: /docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
 volumes:
   pgdata:
+  natsdata:

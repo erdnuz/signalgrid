@@ -54,7 +54,7 @@ async def test_forecast_loop_publishes_forecast_message():
 
     assert len(fake_nc.published) >= 1
     subject, payload = fake_nc.published[0]
-    assert subject == "forecasts"
+    assert subject == "sg.forecasts.StationA.0"
 
     message = json.loads(payload.decode())
     assert message["station"] == "StationA"

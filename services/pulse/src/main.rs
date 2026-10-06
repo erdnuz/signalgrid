@@ -1,75 +1,110 @@
-use anyhow::Context;
-use async_nats::ConnectOptions;
-use bytes::Bytes;
+use anyhow::ensure;
 use chrono::Utc;
+use metrics::{counter, gauge};
 use pulse::simulator::IoTSensorSimulator;
-use std::env;
-use tokio::time::Duration;
+use signalgrid_core::config::{connect_nats, env_or};
+use signalgrid_core::telemetry::{init_metrics, init_tracing};
+use signalgrid_core::{shutdown_signal, subjects, RawEvent};
+use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{error, info};
 
-const PUBLISH_INTERVAL_MS: u64 = 100;
+struct Station {
+    name: String,
+    subject: String,
+    simulator: IoTSensorSimulator,
+}
 
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = term.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = ctrl_c.await;
-    }
+fn station_name(index: usize) -> String {
+    format!("Station{}", (b'A' + index as u8) as char)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing("pulse");
+    init_metrics()?;
 
-    let nats_url = env::var("NATS_URL").context("NATS_URL environment variable must be set")?;
-    let nc = ConnectOptions::new()
-        .retry_on_initial_connect()
-        .connect(&nats_url)
-        .await?;
-    info!(service = "pulse", event = "nats_connected", %nats_url);
+    let n_stations: usize = env_or("N_STATIONS", 2)?;
+    let interval_ms: u64 = env_or("PUBLISH_INTERVAL_MS", 100)?;
+    let seed: Option<u64> = std::env::var("SEED").ok().map(|s| s.parse()).transpose()?;
+    ensure!(
+        (1..=26).contains(&n_stations),
+        "N_STATIONS must be between 1 and 26"
+    );
+    ensure!(interval_ms > 0, "PUBLISH_INTERVAL_MS must be positive");
 
-    let mut simulator = IoTSensorSimulator::new();
-    let mut interval = tokio::time::interval(Duration::from_millis(PUBLISH_INTERVAL_MS));
+    let mut stations: Vec<Station> = (0..n_stations)
+        .map(|i| {
+            let name = station_name(i);
+            let simulator = match seed {
+                Some(seed) => IoTSensorSimulator::with_seed(seed.wrapping_add(i as u64)),
+                None => IoTSensorSimulator::new(),
+            };
+            Station {
+                subject: subjects::raw(&name),
+                name,
+                simulator,
+            }
+        })
+        .collect();
+
+    let nc = connect_nats("pulse").await?;
+    info!(
+        event = "publishing",
+        n_stations,
+        interval_ms,
+        seeded = seed.is_some()
+    );
+
+    let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                info!(service = "pulse", event = "signal_received");
-                break;
-            }
+            _ = &mut shutdown => break,
             _ = interval.tick() => {}
         }
 
-        let sample = simulator.step();
-        let event = serde_json::json!({
-            "timestamp": Utc::now().timestamp_millis() as u64,
-            "values": sample,
-            "regime": simulator.regime_idx,
-            "station": "StationA"
-        });
+        let timestamp = Utc::now().timestamp_millis();
+        for station in &mut stations {
+            let values = station.simulator.step();
+            let regime = station.simulator.regime_idx as u8;
+            gauge!("pulse_regime", "station" => station.name.clone()).set(regime as f64);
 
-        match serde_json::to_vec(&event) {
-            Ok(encoded) => {
-                let payload: Bytes = encoded.into();
-                if let Err(e) = nc.publish("events", payload).await {
-                    error!(service = "pulse", event = "publish_failed", error = %e);
+            let event = RawEvent {
+                station: station.name.clone(),
+                timestamp,
+                values,
+                regime: Some(regime),
+            };
+            let payload = match serde_json::to_vec(&event) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(event = "encode_failed", error = %e);
+                    continue;
                 }
+            };
+            match nc.publish(station.subject.clone(), payload.into()).await {
+                Ok(()) => counter!("pulse_events_published_total").increment(1),
+                Err(e) => error!(event = "publish_failed", error = %e),
             }
-            Err(e) => error!(service = "pulse", event = "encode_failed", error = %e),
         }
     }
 
     nc.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn station_names_are_valid_subject_tokens() {
+        for i in 0..26 {
+            assert!(subjects::is_valid_token(&station_name(i)));
+        }
+        assert_eq!(station_name(0), "StationA");
+    }
 }

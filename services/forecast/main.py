@@ -11,7 +11,7 @@ from nats.aio.client import Client as NATS
 import numpy as np
 
 FORECAST_HORIZON = 3
-TIME_DELTA_SEC = 0.4
+TIME_DELTA_SEC = 0.5  # matches forge WINDOW_MS
 MAX_POINTS = 50
 MIN_POINTS = 20
 CI_ALPHA = 0.02  # two-sided -> 98% interval
@@ -135,7 +135,7 @@ async def forecast_loop(nc: NATS, key, stop_event: asyncio.Event):
                     forecast_vals_list,
                     ci_list,
                 )
-                await nc.publish("forecasts", json.dumps(forecast_msg).encode())
+                await nc.publish(f"sg.forecasts.{key[0]}.{key[1]}", json.dumps(forecast_msg).encode())
             await asyncio.sleep(TIME_DELTA_SEC)
     except asyncio.CancelledError:
         logger.info("service=forecast event=task_cancelled key=%s", key)
@@ -175,7 +175,7 @@ async def process_stats_and_forecast(nats_url: str, stop_event: asyncio.Event):
                         "service=forecast event=handle_stats_failed error=%s", exc
                     )
 
-            await nc.subscribe("stats", cb=handle_stats)
+            await nc.subscribe("sg.stats.>", cb=handle_stats)
             logger.info("service=forecast event=subscribed topic=stats")
 
             await stop_event.wait()

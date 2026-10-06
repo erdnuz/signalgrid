@@ -323,9 +323,9 @@ async def consume_events(stop_event: asyncio.Event):
                 except Exception as exc:
                     logger.error("handle_forecast_failed", error=str(exc))
 
-            await nc.subscribe("stats", cb=handle_stats)
-            await nc.subscribe("forecasts", cb=handle_forecast)
-            logger.info("subscribed", topics=["stats", "forecasts"])
+            await nc.subscribe("sg.stats.>", cb=handle_stats)
+            await nc.subscribe("sg.forecasts.>", cb=handle_forecast)
+            logger.info("subscribed", topics=["sg.stats.>", "sg.forecasts.>"])
 
             await stop_event.wait()
         except Exception as exc:

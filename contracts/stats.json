@@ -1,0 +1,11 @@
+{
+  "station": "StationA",
+  "sensor": 2,
+  "timestamp": 1700000000000,
+  "window_ms": 500,
+  "mean": 1.5,
+  "min": 1.25,
+  "max": 1.75,
+  "count": 5,
+  "regime": 1
+}

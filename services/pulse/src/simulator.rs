@@ -100,9 +100,10 @@ impl IoTSensorSimulator {
 
         let z: [f64; N_CHANNELS] = std::array::from_fn(|_| self.rng.sample(StandardNormal));
         let l = &self.chol[r];
-        for i in 0..N_CHANNELS {
-            let shock: f64 = (0..=i).map(|j| l[i][j] * z[j]).sum();
-            self.state[i] += OU_THETA[r][i] * (OU_MU[r][i] - self.state[i]) + OU_SIGMA[r][i] * shock;
+        for (i, (x, l_row)) in self.state.iter_mut().zip(l).enumerate() {
+            // Lower-triangular: only l[i][0..=i] is non-zero.
+            let shock: f64 = l_row[..=i].iter().zip(&z).map(|(l, z)| l * z).sum();
+            *x += OU_THETA[r][i] * (OU_MU[r][i] - *x) + OU_SIGMA[r][i] * shock;
         }
 
         let u: f64 = self.rng.random();
@@ -111,7 +112,12 @@ impl IoTSensorSimulator {
             cumulative += p;
             if u < cumulative {
                 if next != r {
-                    tracing::info!(service = "pulse", event = "regime_change", from = r, to = next);
+                    tracing::info!(
+                        service = "pulse",
+                        event = "regime_change",
+                        from = r,
+                        to = next
+                    );
                 }
                 self.regime_idx = next;
                 break;
@@ -212,7 +218,8 @@ mod tests {
         let mut acc = [[0.0; N_CHANNELS]; N_CHANNELS];
         for _ in 0..n {
             let z: [f64; N_CHANNELS] = std::array::from_fn(|_| sim.rng.sample(StandardNormal));
-            let x: [f64; N_CHANNELS] = std::array::from_fn(|i| (0..=i).map(|j| l[i][j] * z[j]).sum());
+            let x: [f64; N_CHANNELS] =
+                std::array::from_fn(|i| (0..=i).map(|j| l[i][j] * z[j]).sum());
             for i in 0..N_CHANNELS {
                 for j in 0..N_CHANNELS {
                     acc[i][j] += x[i] * x[j];
@@ -222,7 +229,11 @@ mod tests {
         for i in 0..N_CHANNELS {
             for j in 0..N_CHANNELS {
                 let emp = acc[i][j] / n as f64;
-                assert!((emp - target[i][j]).abs() < 0.02, "({i},{j}) {emp} vs {}", target[i][j]);
+                assert!(
+                    (emp - target[i][j]).abs() < 0.02,
+                    "({i},{j}) {emp} vs {}",
+                    target[i][j]
+                );
             }
         }
     }

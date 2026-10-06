@@ -1,87 +1,132 @@
-use anyhow::Context;
-use async_nats::ConnectOptions;
-use bytes::Bytes;
+use async_nats::jetstream::{self, message::PublishMessage};
 use chrono::Utc;
-use forge::{aggregate_stats, prune_expired, Event};
-use futures::stream::StreamExt;
-use std::env;
-use tokio::time::{self, Duration};
+use forge::{Ingest, WindowAggregator};
+use futures::future::join_all;
+use futures::StreamExt;
+use metrics::{counter, gauge, histogram};
+use signalgrid_core::config::{connect_nats, env_or};
+use signalgrid_core::subjects::{self, ensure_stats_stream};
+use signalgrid_core::telemetry::{init_metrics, init_tracing};
+use signalgrid_core::{shutdown_signal, RawEvent, Stats};
+use std::future::IntoFuture;
+use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tracing::{error, info, warn};
 
-const INITIAL_AGGREGATION_DELAY_SECS: u64 = 5;
-const AGGREGATION_INTERVAL_MS: u64 = 400;
+/// Publishes closed windows to JetStream. The window identity is sent as
+/// `Nats-Msg-Id`, so a re-publish after a crash is de-duplicated by the server.
+async fn publish(js: &jetstream::Context, stats: Vec<Stats>) {
+    if stats.is_empty() {
+        return;
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    let mut acks = Vec::with_capacity(stats.len());
 
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = term.recv() => {}
+    for stat in &stats {
+        histogram!("forge_window_emit_lag_ms")
+            .record((now_ms - (stat.timestamp + stat.window_ms)) as f64);
+        let payload = match serde_json::to_vec(stat) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(event = "encode_stats_failed", error = %e);
+                continue;
+            }
+        };
+        let message = PublishMessage::build()
+            .payload(payload.into())
+            .message_id(stat.message_id());
+        match js
+            .send_publish(subjects::stats(&stat.station, stat.sensor), message)
+            .await
+        {
+            Ok(ack) => acks.push(ack),
+            Err(e) => {
+                counter!("forge_publish_failures_total").increment(1);
+                error!(event = "publish_stats_failed", error = %e);
+            }
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = ctrl_c.await;
+
+    for result in join_all(acks.into_iter().map(IntoFuture::into_future)).await {
+        match result {
+            Ok(ack) if ack.duplicate => counter!("forge_publish_duplicates_total").increment(1),
+            Ok(_) => counter!("forge_stats_published_total").increment(1),
+            Err(e) => {
+                counter!("forge_publish_failures_total").increment(1);
+                error!(event = "publish_ack_failed", error = %e);
+            }
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing("forge");
+    init_metrics()?;
 
-    let nats_url = env::var("NATS_URL").context("NATS_URL environment variable must be set")?;
-    let client = ConnectOptions::new()
-        .retry_on_initial_connect()
-        .connect(&nats_url)
-        .await?;
-    info!(service = "forge", event = "nats_connected", %nats_url);
+    let window_ms: i64 = env_or("WINDOW_MS", 500)?;
+    let lateness_ms: i64 = env_or("ALLOWED_LATENESS_MS", 200)?;
+    // Close everything if input stops, so the last windows are not held forever.
+    let idle_flush = Duration::from_millis(env_or("IDLE_FLUSH_MS", 2_000)?);
 
-    let mut sub = client.subscribe("events").await?;
-    let mut buffer: Vec<Event> = Vec::new();
-    let start = time::Instant::now() + Duration::from_secs(INITIAL_AGGREGATION_DELAY_SECS);
-    let mut ticker = time::interval_at(start, Duration::from_millis(AGGREGATION_INTERVAL_MS));
+    let client = connect_nats("forge").await?;
+    let js = jetstream::new(client.clone());
+    ensure_stats_stream(&js).await?;
+    let mut sub = client.subscribe(subjects::RAW_ALL).await?;
+    info!(
+        event = "subscribed",
+        subject = subjects::RAW_ALL,
+        window_ms,
+        lateness_ms
+    );
+
+    let mut agg = WindowAggregator::new(window_ms, lateness_ms);
+    let mut ticker = time::interval(Duration::from_millis((window_ms as u64 / 5).max(10)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_event = Instant::now();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                info!(service = "forge", event = "signal_received");
-                break;
-            }
+            _ = &mut shutdown => break,
 
             maybe_msg = sub.next() => {
                 let Some(msg) = maybe_msg else {
-                    warn!(service = "forge", event = "subscription_closed");
+                    warn!(event = "subscription_closed");
                     break;
                 };
-                match serde_json::from_slice::<Event>(&msg.payload) {
-                    Ok(event) => buffer.push(event),
-                    Err(e) => error!(service = "forge", event = "parse_event_failed", error = %e),
+                match serde_json::from_slice::<RawEvent>(&msg.payload) {
+                    Ok(event) => {
+                        last_event = Instant::now();
+                        match agg.ingest(&event) {
+                            Ingest::Accepted { dropped_values } => {
+                                counter!("forge_events_total").increment(1);
+                                counter!("forge_non_finite_values_total").increment(dropped_values as u64);
+                            }
+                            Ingest::Late => counter!("forge_late_events_total").increment(1),
+                        }
+                    }
+                    Err(e) => {
+                        counter!("forge_parse_errors_total").increment(1);
+                        error!(event = "parse_event_failed", error = %e);
+                    }
                 }
             }
 
             _ = ticker.tick() => {
-                let now_ms = Utc::now().timestamp_millis() as u64;
-                prune_expired(&mut buffer, now_ms);
-                for stat in aggregate_stats(&buffer, now_ms) {
-                    match serde_json::to_vec(&stat) {
-                        Ok(encoded) => {
-                            let payload: Bytes = encoded.into();
-                            if let Err(e) = client.publish("stats", payload).await {
-                                error!(service = "forge", event = "publish_stats_failed", error = %e);
-                            }
-                        }
-                        Err(e) => error!(service = "forge", event = "encode_stats_failed", error = %e),
-                    }
-                }
+                let ready = if last_event.elapsed() > idle_flush {
+                    agg.close_all()
+                } else {
+                    agg.close_ready()
+                };
+                publish(&js, ready).await;
+                gauge!("forge_open_windows").set(agg.open_windows() as f64);
             }
         }
     }
 
+    info!(event = "draining", open_windows = agg.open_windows());
+    publish(&js, agg.close_all()).await;
     client.flush().await?;
     Ok(())
 }
