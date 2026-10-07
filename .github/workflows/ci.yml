@@ -69,12 +69,25 @@ jobs:
 
   e2e:
     name: End-to-end (docker compose)
-    needs: [rust, python]
+    # Independent of the other jobs, so it runs in parallel with them.
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE: ci  # same code without LTO: much faster image builds
     steps:
       - uses: actions/checkout@v4
       - run: cp .env.example .env
-      - run: docker compose up -d --build --wait --wait-timeout 300
+      - uses: docker/setup-buildx-action@v3
+      # One bake builds every image (the Rust builder stage is shared by all
+      # three services), with layers cached across runs in the Actions cache.
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: docker-compose.yml
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+      - run: docker compose up -d --no-build --wait --wait-timeout 120
       - run: python3 scripts/smoke_test.py
       - name: Service logs
         if: failure()

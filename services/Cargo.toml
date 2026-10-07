@@ -38,3 +38,9 @@ all = { level = "warn", priority = -1 }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Fast optimised build for CI images: same code paths, no LTO.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
