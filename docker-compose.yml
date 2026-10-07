@@ -1,87 +1,140 @@
+name: signalgrid
+
+x-rust-service: &rust-service
+  restart: unless-stopped
+  stop_grace_period: 15s
+  environment: &rust-env
+    NATS_URL: ${NATS_URL}
+    LOG_FORMAT: json
+    RUST_LOG: info
+  depends_on:
+    nats:
+      condition: service_healthy
+
 services:
-  # Message Bus (NATS)
+  # Message bus with JetStream persistence for the stats stream.
   nats:
-    image: nats:latest
-    container_name: signalgrid-nats
+    image: nats:2.10-alpine
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
     ports:
-      - "4222:4222"   # client connections
-      - "8222:8222"   # monitoring UI
+      - "127.0.0.1:4222:4222"   # client connections
+      - "127.0.0.1:8222:8222"   # monitoring
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
-  # Pulse: Event Producer
+  # Pulse: regime-switching OU simulator -> sg.raw.<station>
   pulse:
+    <<: *rust-service
     build:
-      context: ./services/pulse
-      dockerfile: Dockerfile
-    container_name: signalgrid-pulse
+      context: ./services
+      target: pulse
+      args: { CARGO_PROFILE: "${CARGO_PROFILE:-release}" }
     environment:
-      NATS_URL: ${NATS_URL}
-    depends_on:
-      - nats
-    restart: unless-stopped
+      <<: *rust-env
+      N_STATIONS: ${N_STATIONS:-2}
+      PUBLISH_INTERVAL_MS: ${PUBLISH_INTERVAL_MS:-100}
 
-  # Forge: Event Processor
+  # Forge: event-time tumbling windows -> sg.stats.<station>.<sensor> (JetStream)
   forge:
+    <<: *rust-service
     build:
-      context: ./services/forge
-      dockerfile: Dockerfile
-    container_name: signalgrid-forge
+      context: ./services
+      target: forge
+      args: { CARGO_PROFILE: "${CARGO_PROFILE:-release}" }
     environment:
-      NATS_URL: ${NATS_URL}
-    depends_on:
-      - nats
-    restart: unless-stopped
+      <<: *rust-env
+      WINDOW_MS: ${WINDOW_MS:-500}
 
-  # Archive: Storage + REST API
+  # Archive: durable JetStream consumer -> PostgreSQL, REST API on :8003
   archive:
+    <<: *rust-service
     build:
-      context: ./services/archive
-      dockerfile: Dockerfile
-    container_name: signalgrid-archive
+      context: ./services
+      target: archive
+      args: { CARGO_PROFILE: "${CARGO_PROFILE:-release}" }
     environment:
-      NATS_URL: ${NATS_URL}
+      <<: *rust-env
       DATABASE_URL: ${DATABASE_URL}
     depends_on:
-      - nats
-      - postgres
-    restart: unless-stopped
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8003:8003"
 
   forecast:
     build:
       context: ./services/forecast
-      dockerfile: Dockerfile
-    container_name: signalgrid-forecast
     environment:
       NATS_URL: ${NATS_URL}
     depends_on:
-      - nats
+      nats:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile
-    container_name: signalgrid-frontend
     environment:
       NATS_URL: ${NATS_URL}
+      ARCHIVE_URL: http://archive:8003
     depends_on:
-      - nats
+      nats:
+        condition: service_healthy
     ports:
-      - "8004:8004"
+      - "127.0.0.1:8004:8004"
     restart: unless-stopped
 
-  # PostgreSQL
   postgres:
-    image: postgres:15
-    container_name: signalgrid-postgres
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
-      - type: bind
-        source: ./init.sql
-        target: /docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
+
+  # Observability: every service exposes /metrics on :9000 inside the network.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=2d"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/signalgrid.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  natsdata:

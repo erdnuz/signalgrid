@@ -1,134 +1,346 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+//! Event-time tumbling-window aggregation with per-station watermarks.
+//!
+//! Windows are aligned to multiples of `window_ms` on the event timestamp, so
+//! every sample belongs to exactly one window regardless of when it arrives.
+//!
+//! Each station has its own watermark (latest event time seen from that
+//! station minus the allowed lateness). NATS delivers one publisher's messages
+//! on a subject in order, so a station's window is complete as soon as that
+//! station's first sample of a later window arrives; with zero lateness it is
+//! emitted immediately instead of waiting on a global watermark that the
+//! slowest station holds back. Events for an already-closed window are
+//! reported as late and dropped.
+//!
+//! Each open window holds O(1) running accumulators per sensor, so memory is
+//! bounded by the number of open windows rather than by the event rate.
 
-pub const AGGREGATION_WINDOW_MS: u64 = 600;
+use signalgrid_core::{RawEvent, Stats};
+use std::collections::{BTreeMap, HashMap};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Event {
-    pub timestamp: u64,
-    pub values: Vec<f64>,
-    pub station: String,
+#[derive(Debug, Clone, Copy)]
+struct Accumulator {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Stats {
-    pub station: String,
-    pub sensor: usize,
-    pub mean: f64,
-    pub min: f64,
-    pub max: f64,
-    pub count: usize,
-    pub timestamp: u64,
-}
-
-pub fn aggregate_stats(events: &[Event], now_ms: u64) -> Vec<Stats> {
-    let cutoff_ms = now_ms.saturating_sub(AGGREGATION_WINDOW_MS);
-
-    let mut map: HashMap<(String, usize), Vec<f64>> = HashMap::new();
-    for event in events.iter().filter(|event| event.timestamp > cutoff_ms) {
-        for (sensor_idx, &value) in event.values.iter().enumerate() {
-            map.entry((event.station.clone(), sensor_idx))
-                .or_default()
-                .push(value);
+impl Accumulator {
+    fn new(value: f64) -> Self {
+        Self {
+            count: 1,
+            sum: value,
+            min: value,
+            max: value,
         }
     }
 
-    let mut aggregated = Vec::new();
-    for ((station, sensor), values) in map {
-        let clean_values: Vec<f64> = values.into_iter().filter(|value| value.is_finite()).collect();
+    fn push(&mut self, value: f64) {
+        self.count += 1;
+        self.sum += value;
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+    }
+}
 
-        if clean_values.is_empty() {
-            eprintln!(
-                "Skipping stats aggregation for {}:{} due to empty/non-finite values",
-                station, sensor
-            );
-            continue;
+#[derive(Debug, Default)]
+struct Window {
+    sensors: BTreeMap<u32, Accumulator>,
+    /// Ground-truth regime counts.
+    regimes: BTreeMap<u8, u32>,
+}
+
+#[derive(Debug, Default)]
+struct StationState {
+    open: BTreeMap<i64, Window>,
+    max_event_ts: Option<i64>,
+    /// Windows starting before this are closed; events for them are late.
+    closed_before: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingest {
+    /// Accepted; `dropped_values` non-finite readings were ignored.
+    Accepted { dropped_values: usize },
+    /// The event's window was already closed.
+    Late,
+}
+
+#[derive(Debug)]
+pub struct WindowAggregator {
+    window_ms: i64,
+    allowed_lateness_ms: i64,
+    stations: HashMap<String, StationState>,
+}
+
+impl WindowAggregator {
+    pub fn new(window_ms: i64, allowed_lateness_ms: i64) -> Self {
+        assert!(window_ms > 0, "window_ms must be positive");
+        assert!(allowed_lateness_ms >= 0, "allowed_lateness_ms must be >= 0");
+        Self {
+            window_ms,
+            allowed_lateness_ms,
+            stations: HashMap::new(),
         }
-
-        let count = clean_values.len();
-        let min = clean_values.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = clean_values
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let mean = clean_values.iter().sum::<f64>() / count as f64;
-
-        aggregated.push(Stats {
-            station,
-            sensor,
-            mean,
-            min,
-            max,
-            count,
-            timestamp: now_ms,
-        });
     }
 
-    aggregated
+    pub fn window_ms(&self) -> i64 {
+        self.window_ms
+    }
+
+    pub fn window_start(&self, ts: i64) -> i64 {
+        ts - ts.rem_euclid(self.window_ms)
+    }
+
+    pub fn open_windows(&self) -> usize {
+        self.stations.values().map(|s| s.open.len()).sum()
+    }
+
+    pub fn watermark(&self, station: &str) -> Option<i64> {
+        self.stations
+            .get(station)?
+            .max_event_ts
+            .map(|ts| ts.saturating_sub(self.allowed_lateness_ms))
+    }
+
+    pub fn ingest(&mut self, event: &RawEvent) -> Ingest {
+        let start = self.window_start(event.timestamp);
+        let state = self.stations.entry(event.station.clone()).or_default();
+        if state.closed_before.is_some_and(|bound| start < bound) {
+            return Ingest::Late;
+        }
+
+        let window = state.open.entry(start).or_default();
+        let mut dropped_values = 0;
+        for (sensor, &value) in event.values.iter().enumerate() {
+            if !value.is_finite() {
+                dropped_values += 1;
+                continue;
+            }
+            window
+                .sensors
+                .entry(sensor as u32)
+                .and_modify(|acc| acc.push(value))
+                .or_insert_with(|| Accumulator::new(value));
+        }
+        if let Some(regime) = event.regime {
+            *window.regimes.entry(regime).or_default() += 1;
+        }
+
+        state.max_event_ts = Some(
+            state
+                .max_event_ts
+                .map_or(event.timestamp, |m| m.max(event.timestamp)),
+        );
+        Ingest::Accepted { dropped_values }
+    }
+
+    /// Closes and returns, per station, every window whose end is at or
+    /// before that station's watermark.
+    pub fn close_ready(&mut self) -> Vec<Stats> {
+        let (w, lateness) = (self.window_ms, self.allowed_lateness_ms);
+        let mut out = Vec::new();
+        for (station, state) in &mut self.stations {
+            if let Some(max_ts) = state.max_event_ts {
+                // A window [s, s + w) is complete when s + w <= watermark.
+                let bound = max_ts
+                    .saturating_sub(lateness)
+                    .saturating_sub(w)
+                    .saturating_add(1);
+                close_before(station, state, bound, w, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Closes every open window of stations whose newest event is more than
+    /// `idle_ms` older than `now_ms`, so a station that stops publishing does
+    /// not hold its last window forever.
+    pub fn close_idle(&mut self, now_ms: i64, idle_ms: i64) -> Vec<Stats> {
+        let w = self.window_ms;
+        let mut out = Vec::new();
+        for (station, state) in &mut self.stations {
+            let idle = state.max_event_ts.is_some_and(|ts| now_ms - ts > idle_ms);
+            if let (true, Some(&last)) = (idle, state.open.keys().next_back()) {
+                close_before(station, state, last + 1, w, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Closes every open window (used on shutdown).
+    pub fn close_all(&mut self) -> Vec<Stats> {
+        let w = self.window_ms;
+        let mut out = Vec::new();
+        for (station, state) in &mut self.stations {
+            if let Some(&last) = state.open.keys().next_back() {
+                close_before(station, state, last + 1, w, &mut out);
+            }
+        }
+        out
+    }
+}
+
+fn close_before(
+    station: &str,
+    state: &mut StationState,
+    bound: i64,
+    window_ms: i64,
+    out: &mut Vec<Stats>,
+) {
+    let still_open = state.open.split_off(&bound);
+    let ready = std::mem::replace(&mut state.open, still_open);
+    state.closed_before = Some(state.closed_before.map_or(bound, |b| b.max(bound)));
+
+    for (start, window) in ready {
+        let regime = majority(&window.regimes);
+        for (sensor, acc) in window.sensors {
+            out.push(Stats {
+                station: station.to_string(),
+                sensor,
+                timestamp: start,
+                window_ms,
+                mean: acc.sum / acc.count as f64,
+                min: acc.min,
+                max: acc.max,
+                count: acc.count,
+                regime,
+            });
+        }
+    }
+}
+
+/// Most frequent regime; ties resolve to the lowest regime id.
+fn majority(counts: &BTreeMap<u8, u32>) -> Option<u8> {
+    counts
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        .map(|(&regime, _)| regime)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn mk_event(station: &str, timestamp: u64, values: Vec<f64>) -> Event {
-        Event {
-            timestamp,
-            values,
+    fn ev(station: &str, ts: i64, values: Vec<f64>, regime: Option<u8>) -> RawEvent {
+        RawEvent {
             station: station.to_string(),
+            timestamp: ts,
+            values,
+            regime,
         }
     }
 
     #[test]
-    fn aggregate_stats_groups_by_station_and_sensor() {
-        let now = 1_000;
-        let events = vec![
-            mk_event("A", 900, vec![1.0, 2.0]),
-            mk_event("A", 950, vec![3.0, 4.0]),
-            mk_event("B", 980, vec![10.0]),
-        ];
+    fn groups_by_window_station_and_sensor() {
+        let mut agg = WindowAggregator::new(500, 0);
+        agg.ingest(&ev("A", 1_000, vec![1.0, 2.0], None));
+        agg.ingest(&ev("A", 1_400, vec![3.0, 4.0], None));
+        agg.ingest(&ev("B", 1_200, vec![10.0], None));
 
-        let mut out = aggregate_stats(&events, now);
-        out.sort_by(|a, b| a.station.cmp(&b.station).then(a.sensor.cmp(&b.sensor)));
-
+        let out = agg.close_all();
         assert_eq!(out.len(), 3);
+        let a0 = out
+            .iter()
+            .find(|s| s.station == "A" && s.sensor == 0)
+            .unwrap();
+        assert_eq!(a0.timestamp, 1_000);
+        assert_eq!(a0.count, 2);
+        assert!((a0.mean - 2.0).abs() < 1e-12);
+        assert_eq!((a0.min, a0.max), (1.0, 3.0));
+    }
+
+    #[test]
+    fn windows_close_only_after_watermark_passes_their_end() {
+        let mut agg = WindowAggregator::new(500, 100);
+        agg.ingest(&ev("A", 1_000, vec![1.0], None));
+        agg.ingest(&ev("A", 1_550, vec![1.0], None));
+        // watermark = 1450 < window end 1500
+        assert!(agg.close_ready().is_empty());
+
+        agg.ingest(&ev("A", 1_600, vec![1.0], None));
+        // watermark = 1500 -> [1000, 1500) closes, [1500, 2000) stays open
+        let out = agg.close_ready();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].timestamp, 1_000);
+        assert_eq!(agg.open_windows(), 1);
+    }
+
+    #[test]
+    fn zero_lateness_emits_on_the_first_event_of_the_next_window() {
+        let mut agg = WindowAggregator::new(500, 0);
+        agg.ingest(&ev("A", 1_400, vec![1.0], None));
+        assert!(agg.close_ready().is_empty());
+        agg.ingest(&ev("A", 1_500, vec![1.0], None));
+        assert_eq!(agg.close_ready().len(), 1);
+    }
+
+    #[test]
+    fn stations_close_independently() {
+        // A lagging station must not hold back the others' windows.
+        let mut agg = WindowAggregator::new(500, 0);
+        agg.ingest(&ev("A", 1_000, vec![1.0], None));
+        agg.ingest(&ev("B", 1_000, vec![2.0], None));
+        agg.ingest(&ev("A", 1_500, vec![1.0], None));
+        let out = agg.close_ready();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].station.as_str(), out[0].timestamp), ("A", 1_000));
+        // B's window is still open and B's next sample is not late.
+        assert!(matches!(
+            agg.ingest(&ev("B", 1_200, vec![2.0], None)),
+            Ingest::Accepted { .. }
+        ));
+        assert_eq!(agg.watermark("B"), Some(1_200));
+    }
+
+    #[test]
+    fn idle_stations_are_flushed() {
+        let mut agg = WindowAggregator::new(500, 0);
+        agg.ingest(&ev("A", 1_000, vec![1.0], None));
+        agg.ingest(&ev("B", 5_000, vec![1.0], None));
+        let out = agg.close_idle(5_100, 2_000);
+        assert_eq!(out.len(), 1);
         assert_eq!(out[0].station, "A");
-        assert_eq!(out[0].sensor, 0);
-        assert_eq!(out[0].count, 2);
-        assert!((out[0].mean - 2.0).abs() < 1e-9);
-
-        assert_eq!(out[1].station, "A");
-        assert_eq!(out[1].sensor, 1);
-        assert_eq!(out[1].count, 2);
-        assert!((out[1].mean - 3.0).abs() < 1e-9);
-
-        assert_eq!(out[2].station, "B");
-        assert_eq!(out[2].sensor, 0);
-        assert_eq!(out[2].count, 1);
-        assert!((out[2].mean - 10.0).abs() < 1e-9);
+        assert_eq!(agg.open_windows(), 1);
     }
 
     #[test]
-    fn aggregate_stats_drops_old_events_outside_window() {
-        let now = 10_000;
-        let old_ts = now - AGGREGATION_WINDOW_MS - 1;
-        let recent_ts = now - 1;
-        let events = vec![mk_event("A", old_ts, vec![100.0]), mk_event("A", recent_ts, vec![2.0])];
-
-        let out = aggregate_stats(&events, now);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].count, 1);
-        assert!((out[0].mean - 2.0).abs() < 1e-9);
+    fn events_for_closed_windows_are_late() {
+        let mut agg = WindowAggregator::new(500, 0);
+        agg.ingest(&ev("A", 2_100, vec![1.0], None));
+        // watermark 2100: [1500, 2000) is complete even though it saw no data
+        assert!(agg.close_ready().is_empty());
+        assert_eq!(agg.ingest(&ev("A", 1_900, vec![9.0], None)), Ingest::Late);
+        assert!(matches!(
+            agg.ingest(&ev("A", 2_200, vec![1.0], None)),
+            Ingest::Accepted { .. }
+        ));
     }
 
     #[test]
-    fn aggregate_stats_filters_non_finite_values() {
-        let now = 1_000;
-        let events = vec![mk_event("A", 950, vec![f64::NAN, f64::INFINITY, 5.0])];
-
-        let out = aggregate_stats(&events, now);
+    fn filters_non_finite_values() {
+        let mut agg = WindowAggregator::new(500, 0);
+        let outcome = agg.ingest(&ev("A", 1_000, vec![f64::NAN, f64::INFINITY, 5.0], None));
+        assert_eq!(outcome, Ingest::Accepted { dropped_values: 2 });
+        let out = agg.close_all();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].count, 1);
-        assert!((out[0].mean - 5.0).abs() < 1e-9);
+        assert_eq!(out[0].sensor, 2);
+    }
+
+    #[test]
+    fn reports_majority_regime_per_station() {
+        let mut agg = WindowAggregator::new(500, 0);
+        for regime in [2, 2, 1] {
+            agg.ingest(&ev("A", 1_000, vec![0.0], Some(regime)));
+        }
+        assert_eq!(agg.close_all()[0].regime, Some(2));
+    }
+
+    #[test]
+    fn negative_timestamps_align_to_window_floor() {
+        let agg = WindowAggregator::new(500, 0);
+        assert_eq!(agg.window_start(-1), -500);
+        assert_eq!(agg.window_start(0), 0);
+        assert_eq!(agg.window_start(499), 0);
     }
 }
