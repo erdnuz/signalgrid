@@ -40,9 +40,9 @@ jobs:
           workspaces: services
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # clippy --all-targets already type-checks the benches; building them
+      # here would mean a full LTO release build on every run.
       - run: cargo test --workspace --locked
-      - name: Benchmarks compile
-        run: cargo bench --workspace --no-run --locked
 
   python:
     name: Python (${{ matrix.package }})
