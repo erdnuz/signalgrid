@@ -13,6 +13,7 @@ jobs:
   rust:
     name: Rust (fmt, clippy, test)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: services
@@ -71,6 +72,7 @@ jobs:
     name: End-to-end (docker compose)
     # Independent of the other jobs, so it runs in parallel with them.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       CARGO_PROFILE: ci  # same code without LTO: much faster image builds
     steps:
@@ -88,7 +90,8 @@ jobs:
             *.cache-from=type=gha
             *.cache-to=type=gha,mode=max
       - run: docker compose up -d --no-build --wait --wait-timeout 120
-      - run: python3 scripts/smoke_test.py
+      - run: python3 -u scripts/smoke_test.py
+        timeout-minutes: 5
       - name: Service logs
         if: failure()
         run: docker compose logs --tail 200

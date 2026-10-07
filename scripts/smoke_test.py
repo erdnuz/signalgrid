@@ -73,15 +73,21 @@ async def main():
         "sg.stats.>",
         config=ConsumerConfig(deliver_policy=DeliverPolicy.BY_START_TIME, opt_start_time=start),
     )
+    # Forge keeps publishing, so "fetch until empty" may never end: stop at
+    # the end of the stream as it was when the dump started.
+    until = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
     out = {}
-    while True:
+    done = False
+    while not done:
         try:
             batch = await sub.fetch(1000, timeout=2)
         except Exception:
             break  # caught up
         for msg in batch:
             d = json.loads(msg.data)
-            if d["timestamp"] >= since:
+            if d["timestamp"] >= until or msg.metadata.num_pending == 0:
+                done = True
+            if since <= d["timestamp"] < until:
                 out.setdefault(f'{d["station"]}|{d["sensor"]}', []).append(d["timestamp"])
     print(json.dumps(out))
     await nc.close()
@@ -98,6 +104,7 @@ def jetstream_windows(since_ms: int) -> dict[tuple[str, int], set[int]]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=90,
     )
     raw = json.loads(result.stdout.strip().splitlines()[-1])
     return {(k.split("|")[0], int(k.split("|")[1])): set(v) for k, v in raw.items()}
@@ -147,7 +154,7 @@ def main() -> None:
             ts = [r["timestamp"] for r in rows]
             dupes += len(ts) - len(set(ts))
             stored = set(ts)
-            horizon = max(ts) if ts else since
+            horizon = max(ts) if ts else since  # windows the archive has had time to receive
             expected = {t for t in published.get((st, s), set()) if t <= horizon}
             missing = sorted(expected - stored)
             if missing:
