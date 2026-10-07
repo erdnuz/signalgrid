@@ -89,6 +89,11 @@ jobs:
           set: |
             *.cache-from=type=gha
             *.cache-to=type=gha,mode=max
+            pulse.tags=signalgrid-pulse:latest
+            forge.tags=signalgrid-forge:latest
+            archive.tags=signalgrid-archive:latest
+            forecast.tags=signalgrid-forecast:latest
+            frontend.tags=signalgrid-frontend:latest
       - run: docker compose up -d --no-build --wait --wait-timeout 120
       - run: python3 -u scripts/smoke_test.py
         timeout-minutes: 5
