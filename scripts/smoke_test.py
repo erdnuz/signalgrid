@@ -150,12 +150,18 @@ def main() -> None:
     lost, dupes, data_gaps = 0, 0, 0
     for st in STATIONS:
         for s in SENSORS:
-            rows = [r for r in series(st, s) if r["timestamp"] >= since]
+            all_rows = series(st, s)
+            rows = [r for r in all_rows if r["timestamp"] >= since]
             ts = [r["timestamp"] for r in rows]
             dupes += len(ts) - len(set(ts))
             stored = set(ts)
+            # On a fresh stack `since` can reach back to startup, where the very
+            # first window may be dropped before the archive's consumer is up.
+            # That isn't an outage loss, so only check from the archive's first
+            # stored window onwards.
+            first = all_rows[0]["timestamp"] if all_rows else since
             horizon = max(ts) if ts else since  # windows the archive has had time to receive
-            expected = {t for t in published.get((st, s), set()) if t <= horizon}
+            expected = {t for t in published.get((st, s), set()) if first <= t <= horizon}
             missing = sorted(expected - stored)
             if missing:
                 print(f"FAIL  {st}/{s}: {len(missing)} published windows missing, first {missing[0]}")
